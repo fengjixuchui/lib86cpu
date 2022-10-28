@@ -1,5 +1,5 @@
 /*
- * private implemnetaion of cpu_t
+ * private implementation of cpu_t
  *
  * ergo720                Copyright (c) 2020
  */
@@ -13,6 +13,7 @@
 
 #define CODE_CACHE_MAX_SIZE (1 << 15)
 #define TLB_MAX_SIZE (1 << 20)
+#define IOTLB_MAX_SIZE (1 << 14)
 
  // used to generate the parity table
  // borrowed from Bit Twiddling Hacks by Sean Eron Anderson (public domain)
@@ -28,6 +29,7 @@ namespace llvm {
 	class BasicBlock;
 	class Function;
 	class Module;
+	class Type;
 	class PointerType;
 	class StructType;
 	class Value;
@@ -61,6 +63,25 @@ struct memory_region_t {
 		opaque(nullptr), aliased_region(nullptr), rom_idx(-1) {};
 };
 
+struct cached_io_region {
+	memory_region_t<port_t> *io;
+	fp_read read_handler;
+	fp_write write_handler;
+	void *opaque;
+};
+
+struct cached_mmio_region {
+	memory_region_t<addr_t> *mmio;
+	fp_read read_handler;
+	fp_write write_handler;
+	void *opaque;
+};
+
+struct cached_rom_region {
+	memory_region_t<addr_t> *rom;
+	uint8_t *buffer;
+};
+
 template<typename T>
 struct sort_by_priority
 {
@@ -74,26 +95,30 @@ struct exp_data_t {
 	uint32_t fault_addr;    // addr that caused the exception
 	uint16_t code;          // error code used by the exception (if any)
 	uint16_t idx;           // index number of the exception
-	uint32_t eip;           // eip of the instr that generated the exception
+	uint32_t eip;           // eip to return to after the exception is serviced
 };
 
 struct exp_info_t {
 	exp_data_t exp_data;
-	uint8_t exp_in_flight;  // one when servicing an exception, zero otherwise
+	uint16_t old_exp;       // the exception we were previously servicing
 };
 
 struct cpu_ctx_t;
+struct translated_code_t;
 using entry_t = translated_code_t * (*)(cpu_ctx_t *cpu_ctx);
-using raise_exp_t = entry_t;
+using raise_int_t = void (*)(cpu_ctx_t *cpu_ctx, uint8_t int_flg);
+using iret_t = entry_t; // could just return void
 
+// jmp_offset functions: 0,1 -> used for direct linking (either points to exit or &next_tc), 2 -> exit, 3 -> dbg int, 4 -> hw int
 struct translated_code_t {
 	std::forward_list<translated_code_t *> linked_tc;
 	cpu_t *cpu;
 	addr_t cs_base;
 	addr_t pc;
+	addr_t virt_pc;
 	uint32_t cpu_flags;
 	entry_t ptr_code;
-	entry_t jmp_offset[3];
+	entry_t jmp_offset[5];
 	uint32_t flags;
 	uint32_t size;
 	explicit translated_code_t(cpu_t *cpu) noexcept;
@@ -127,9 +152,11 @@ struct cpu_ctx_t {
 	lazy_eflags_t lazy_eflags;
 	uint32_t hflags;
 	uint32_t tlb[TLB_MAX_SIZE];
+	uint16_t tlb_region_idx[TLB_MAX_SIZE];
+	uint16_t iotlb[IOTLB_MAX_SIZE];
 	uint8_t *ram;
-	raise_exp_t exp_fn;
 	exp_info_t exp_info;
+	uint8_t alignas(1) int_pending;
 };
 
 class lc86_jit;
@@ -143,10 +170,18 @@ struct cpu_t {
 	std::unique_ptr<interval_tree<port_t, std::unique_ptr<memory_region_t<port_t>>>> io_space_tree;
 	std::set<std::reference_wrapper<std::unique_ptr<memory_region_t<addr_t>>>, sort_by_priority<addr_t>> memory_out;
 	std::set<std::reference_wrapper<std::unique_ptr<memory_region_t<port_t>>>, sort_by_priority<port_t>> io_out;
-	std::forward_list<std::shared_ptr<translated_code_t>> code_cache[CODE_CACHE_MAX_SIZE];
+	std::list<std::unique_ptr<translated_code_t>> code_cache[CODE_CACHE_MAX_SIZE];
 	std::unordered_map<uint32_t, std::unordered_set<translated_code_t *>> tc_page_map;
-	std::vector<std::pair<std::unique_ptr<uint8_t[]>, int>> vec_rom;
+	std::unordered_map<addr_t, translated_code_t *> ibtc;
+	std::vector<std::unique_ptr<uint8_t[]>> vec_rom;
 	std::unordered_map<addr_t, std::unique_ptr<hook>> hook_map;
+	std::vector<cached_io_region> iotlb_regions;
+	cached_io_region *iotlb_regions_ptr;
+	std::vector<cached_rom_region> rom_regions;
+	std::vector<cached_mmio_region> mmio_regions;
+	uint16_t num_io_regions;
+	uint16_t num_mmio_regions;
+	uint16_t num_rom_regions;
 	uint16_t num_tc;
 	struct {
 		uint64_t tsc;
@@ -160,6 +195,10 @@ struct cpu_t {
 			uint64_t mask;
 		} phys_var[8];
 	} mtrr;
+	raise_int_t int_fn;
+	std::string dbg_name;
+	addr_t bp_addr;
+	addr_t db_addr;
 
 	// llvm specific variables
 	std::unique_ptr<lc86_jit> jit;
@@ -171,12 +210,16 @@ struct cpu_t {
 	llvm::Value *ptr_eflags;
 	llvm::Value *ptr_hflags;
 	llvm::Value *ptr_tlb;
+	llvm::Value *ptr_tlb_region_idx;
+	llvm::Value *ptr_iotlb;
 	llvm::Value *ptr_ram;
-	llvm::Value *ptr_exp_fn;
-	llvm::Value *ptr_invtc_fn;
-	llvm::Value *ptr_abort_fn;
 	llvm::Value *instr_eip;
 	llvm::BasicBlock *bb; // bb to which we are currently adding llvm instructions
 	llvm::Function *ptr_mem_ldfn[7];
 	llvm::Function *ptr_mem_stfn[7];
+	llvm::Function *ptr_exp_fn;
+	llvm::Function *ptr_abort_fn;
+	llvm::StructType *cpu_ctx_type;
+	llvm::Type *reg_ty;
+	llvm::Type *eflags_ty;
 };

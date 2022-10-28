@@ -13,40 +13,67 @@
 
 using namespace llvm;
 
-void tc_invalidate(cpu_ctx_t *cpu_ctx, translated_code_t *tc, uint32_t addr, uint8_t size, uint32_t eip);
-uint8_t cpu_update_crN(cpu_ctx_t *cpu_ctx, uint32_t new_cr, uint8_t idx, uint32_t eip, uint32_t bytes);
+template<bool remove_hook = false>
+void tc_invalidate(cpu_ctx_t *cpu_ctx, addr_t addr, [[maybe_unused]] uint8_t size = 0, [[maybe_unused]] uint32_t eip = 0);
+extern template void tc_invalidate<true>(cpu_ctx_t *cpu_ctx, addr_t addr, [[maybe_unused]] uint8_t size, [[maybe_unused]] uint32_t eip);
+extern template void tc_invalidate<false>(cpu_ctx_t *cpu_ctx, addr_t addr, [[maybe_unused]] uint8_t size, [[maybe_unused]] uint32_t eip);
+void tc_cache_clear(cpu_t *cpu);
+void tc_cache_purge(cpu_t *cpu);
+uint8_t update_crN_helper(cpu_ctx_t *cpu_ctx, uint32_t new_cr, uint8_t idx, uint32_t eip, uint32_t bytes);
 void cpu_rdtsc_handler(cpu_ctx_t *cpu_ctx);
-void cpu_msr_read(cpu_ctx_t *cpu_ctx);
+void msr_read_helper(cpu_ctx_t *cpu_ctx);
+addr_t get_pc(cpu_ctx_t *cpu_ctx);
+template<bool is_int = false> translated_code_t *cpu_raise_exception(cpu_ctx_t *cpu_ctx);
 
-// cpu hidden flags
+// cpu hidden flags (assumed to be constant during exec of a tc, together with a flag subset of eflags)
+// HFLG_CPL: cpl of cpu
+// HFLG_CS32: 16 or 32 bit code segment
+// HFLG_SS32: 16 or 32 bit stack segment
+// HFLG_PE_MODE: real or protected mode
+// HFLG_CR0_EM: em flag of cr0
+// HFLG_TRAMP: used to select the trampoline tc instead of the hook tc
+// HFLG_DBG_TRAP: used to suppress data/io watchpoints (not recorded in the tc flags)
 #define CPL_SHIFT       0
 #define CS32_SHIFT      2
 #define SS32_SHIFT      3
 #define PE_MODE_SHIFT   4
 #define EM_SHIFT        5
+#define TRAMP_SHIFT     6
+#define DBG_TRAP_SHIFT  7
 #define HFLG_CPL        (3 << CPL_SHIFT)
 #define HFLG_CS32       (1 << CS32_SHIFT)
 #define HFLG_SS32       (1 << SS32_SHIFT)
 #define HFLG_PE_MODE    (1 << PE_MODE_SHIFT)
 #define HFLG_CR0_EM     (1 << EM_SHIFT)
+#define HFLG_TRAMP      (1 << TRAMP_SHIFT)
+#define HFLG_DBG_TRAP   (1 << DBG_TRAP_SHIFT)
+#define HFLG_CONST      (HFLG_CPL | HFLG_CS32 | HFLG_SS32 | HFLG_PE_MODE | HFLG_CR0_EM | HFLG_TRAMP)
+
+// cpu interrupt flags
+#define CPU_NO_INT   0
+#define CPU_DBG_INT  1
+#define CPU_HW_INT   2
 
 // disassembly context flags
 #define DISAS_FLG_CS32         (1 << 0)
 #define DISAS_FLG_PAGE_CROSS   (1 << 2)
 #define DISAS_FLG_FETCH_FAULT  DISAS_FLG_PAGE_CROSS
+#define DISAS_FLG_DBG_FAULT    DISAS_FLG_PAGE_CROSS
 #define DISAS_FLG_ONE_INSTR    CPU_DISAS_ONE
 
-// tc struct flags
-#define TC_FLG_DST_PC     0
-#define TC_FLG_NEXT_PC    1
-#define TC_FLG_RET        2
-#define TC_FLG_NUM_JMP    (3 << 0)
-#define TC_FLG_INDIRECT   (1 << 2)
-#define TC_FLG_DIRECT     (1 << 3)
-#define TC_FLG_JMP_TAKEN  (3 << 4)
-#define TC_FLG_HOOK       (1 << 6)
-#define TC_FLG_DST_ONLY   (1 << 7)
-#define TC_FLG_LINK_MASK  (TC_FLG_INDIRECT | TC_FLG_DIRECT | TC_FLG_DST_ONLY)
+// tc struct flags/offsets
+#define TC_JMP_DST_PC     0
+#define TC_JMP_NEXT_PC    1
+#define TC_JMP_RET        2
+#define TC_FLG_NUM_JMP         (3 << 0)
+#define TC_FLG_INDIRECT        (1 << 2)
+#define TC_FLG_DIRECT          (1 << 3)
+#define TC_FLG_JMP_TAKEN       (3 << 4)
+#define TC_FLG_RET             (1 << 6)
+#define TC_FLG_DST_ONLY        (1 << 7)  // jump(dest_pc)
+#define TC_FLG_COND_DST_ONLY   (1 << 8)  // if [runtime] (cond) jump(dst_pc)
+#define TC_FLG_LINK_MASK  (TC_FLG_INDIRECT | TC_FLG_DIRECT | TC_FLG_RET | TC_FLG_DST_ONLY | TC_FLG_COND_DST_ONLY)
+#define TC_JMP_INT_OFFSET 2
 
 // segment descriptor flags
 #define SEG_DESC_TY   (15ULL << 40) // type
@@ -72,49 +99,49 @@ void cpu_msr_read(cpu_ctx_t *cpu_ctx);
 #define SEG_HIDDEN_TSS_TY  (1 << 11)  // 16/32 tss type
 
 // reg indexes in cpu->regs_layout
-#define EAX_idx     REG_EAX
-#define ECX_idx     REG_ECX
-#define EDX_idx     REG_EDX
-#define EBX_idx     REG_EBX
-#define ESP_idx     REG_ESP
-#define EBP_idx     REG_EBP
-#define ESI_idx     REG_ESI
-#define EDI_idx     REG_EDI
-#define ES_idx      REG_ES
-#define CS_idx      REG_CS
-#define SS_idx      REG_SS
-#define DS_idx      REG_DS
-#define FS_idx      REG_FS
-#define GS_idx      REG_GS
-#define CR0_idx     REG_CR0
-#define CR1_idx     REG_CR1
-#define CR2_idx     REG_CR2
-#define CR3_idx     REG_CR3
-#define CR4_idx     REG_CR4
-#define DR0_idx     REG_DR0
-#define DR1_idx     REG_DR1
-#define DR2_idx     REG_DR2
-#define DR3_idx     REG_DR3
-#define DR4_idx     REG_DR4
-#define DR5_idx     REG_DR5
-#define DR6_idx     REG_DR6
-#define DR7_idx     REG_DR7
-#define EFLAGS_idx  REG_EFLAGS
-#define EIP_idx     REG_EIP
-#define IDTR_idx    REG_IDTR
-#define GDTR_idx    REG_GDTR
-#define LDTR_idx    REG_LDTR
-#define TR_idx      REG_TR
-#define R0_idx      REG_R0
-#define R1_idx      REG_R1
-#define R2_idx      REG_R2
-#define R3_idx      REG_R3
-#define R4_idx      REG_R4
-#define R5_idx      REG_R5
-#define R6_idx      REG_R6
-#define R7_idx      REG_R7
-#define ST_idx      REG_ST
-#define TAG_idx     REG_TAG
+#define EAX_idx     0
+#define ECX_idx     1
+#define EDX_idx     2
+#define EBX_idx     3
+#define ESP_idx     4
+#define EBP_idx     5
+#define ESI_idx     6
+#define EDI_idx     7
+#define ES_idx      8
+#define CS_idx      9
+#define SS_idx      10
+#define DS_idx      11
+#define FS_idx      12
+#define GS_idx      13
+#define CR0_idx     14
+#define CR1_idx     15
+#define CR2_idx     16
+#define CR3_idx     17
+#define CR4_idx     18
+#define DR0_idx     19
+#define DR1_idx     20
+#define DR2_idx     21
+#define DR3_idx     22
+#define DR4_idx     23
+#define DR5_idx     24
+#define DR6_idx     25
+#define DR7_idx     26
+#define EFLAGS_idx  27
+#define EIP_idx     28
+#define IDTR_idx    29
+#define GDTR_idx    30
+#define LDTR_idx    31
+#define TR_idx      32
+#define R0_idx      33
+#define R1_idx      34
+#define R2_idx      35
+#define R3_idx      36
+#define R4_idx      37
+#define R5_idx      38
+#define R6_idx      39
+#define R7_idx      40
+#define ST_idx      41
+#define TAG_idx     42
 
 #define SEG_offset  ES_idx
 #define CR_offset   CR0_idx
@@ -129,17 +156,18 @@ void cpu_msr_read(cpu_ctx_t *cpu_ctx);
 #define F80_HIGH_idx    1
 
 // eflags macros
-#define TF_MASK     (1 << 8)
-#define IF_MASK     (1 << 9)
-#define DF_MASK     (1 << 10)
-#define IOPL_MASK   (3 << 12)
-#define NT_MASK     (1 << 14)
-#define RF_MASK     (1 << 16)
-#define VM_MASK     (1 << 17)
-#define AC_MASK     (1 << 18)
-#define VIF_MASK    (1 << 19)
-#define VIP_MASK    (1 << 20)
-#define ID_MASK     (1 << 21)
+#define TF_MASK        (1 << 8)
+#define IF_MASK        (1 << 9)
+#define DF_MASK        (1 << 10)
+#define IOPL_MASK      (3 << 12)
+#define NT_MASK        (1 << 14)
+#define RF_MASK        (1 << 16)
+#define VM_MASK        (1 << 17)
+#define AC_MASK        (1 << 18)
+#define VIF_MASK       (1 << 19)
+#define VIP_MASK       (1 << 20)
+#define ID_MASK        (1 << 21)
+#define EFLAGS_CONST   (TF_MASK | IOPL_MASK | RF_MASK | AC_MASK)
 
 // exception numbers
 #define EXP_DE  0   // divide error
@@ -160,6 +188,7 @@ void cpu_msr_read(cpu_ctx_t *cpu_ctx);
 #define EXP_AC  17  // alignment check
 #define EXP_MC  18  // machine check
 #define EXP_XF  19  // SIMD floating point exception
+#define EXP_INVALID 0xFFFF
 
 // pte flags
 #define PTE_PRESENT   (1 << 0)
@@ -187,12 +216,25 @@ void cpu_msr_read(cpu_ctx_t *cpu_ctx);
 #define TLB_USER_WRITE  (1 << 3)
 #define TLB_CODE        (1 << 4)
 #define TLB_RAM         (1 << 5)
+#define TLB_ROM         (1 << 6)
+#define TLB_MMIO        (1 << 7)
 #define TLB_GLOBAL      (1 << 8)
 #define TLB_DIRTY       (1 << 9)
 #define TLB_WATCH       (1 << 10)
 #define TLB_zero        0
-#define TLB_keep_rc     1
+#define TLB_keep_cw     1
 #define TLB_no_g        2
+#define TLB_rom         3
+#define TLB_mmio        4
+
+// io macros
+#define IO_SHIFT        2
+#define IO_SIZE         4
+#define IO_MAX_PORT     65536
+
+// iotlb macros
+#define IOTLB_VALID    (1 << 0)
+#define IOTLB_WATCH    (1 << 1)
 
 // control register flags
 #define CR0_PG_MASK (1 << 31)
@@ -212,6 +254,7 @@ CR0_TS_MASK | CR0_EM_MASK | CR0_MP_MASK | CR0_PE_MASK)
 #define CR3_PCD_MASK (1 << 4)
 #define CR3_PWT_MASK (1 << 3)
 #define CR3_FLG_MASK (CR3_PD_MASK | CR3_PCD_MASK | CR3_PWT_MASK)
+#define CR4_VME_MASK (1 << 0)
 #define CR4_TSD_MASK (1 << 2)
 #define CR4_DE_MASK  (1 << 3)
 #define CR4_PSE_MASK (1 << 4)
@@ -225,6 +268,7 @@ CR0_TS_MASK | CR0_EM_MASK | CR0_MP_MASK | CR0_PE_MASK)
 #define DR6_B2_MASK      (1 << 2)
 #define DR6_B3_MASK      (1 << 3)
 #define DR6_BD_MASK      (1 << 13)
+#define DR6_BS_MASK      (1 << 14)
 #define DR6_RES_MASK     0xFFFF0FF0 // dr6 reserved bits
 #define DR7_GD_MASK      (1 << 13)
 #define DR7_RES_MASK     0x400 // dr7 reserved bits
@@ -247,3 +291,5 @@ CR0_TS_MASK | CR0_EM_MASK | CR0_MP_MASK | CR0_PE_MASK)
 #define IA32_MTRR_PHYSMASK(n) (MTRR_PHYSMASK_base + (n * 2))
 
 #define X86_MAX_INSTR_LENGTH 15
+#define ROM_MAX_NUM ((1 << 16) - 1)
+#define MMIO_MAX_NUM ROM_MAX_NUM

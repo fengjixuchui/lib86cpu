@@ -13,11 +13,328 @@
 #include "frontend.h"
 #include "memory.h"
 #include "jit.h"
+#include "main_wnd.h"
+#include "debugger.h"
+#include "helpers.h"
 
-#define BAD LIB86CPU_ABORT_msg("Encountered unimplemented instruction %s", log_instr("", disas_ctx->virt_pc - bytes, &instr).c_str())
+#define BAD LIB86CPU_ABORT_msg("Encountered unimplemented instruction %s", log_instr(disas_ctx->virt_pc - bytes, &instr).c_str())
 
 
-static inline addr_t
+static void
+check_dbl_exp(cpu_ctx_t *cpu_ctx)
+{
+	uint16_t idx = cpu_ctx->exp_info.exp_data.idx;
+	bool old_contributory = cpu_ctx->exp_info.old_exp == 0 || (cpu_ctx->exp_info.old_exp >= 10 && cpu_ctx->exp_info.old_exp <= 13);
+	bool curr_contributory = idx == 0 || (idx >= 10 && idx <= 13);
+
+	LOG(log_level::info, "%s old: %u new %u", __func__, cpu_ctx->exp_info.old_exp, idx);
+
+	if (cpu_ctx->exp_info.old_exp == EXP_DF) {
+		throw lc86_exp_abort("The guest has triple faulted, cannot continue", lc86_status::success);
+	}
+
+	if ((old_contributory && curr_contributory) || (cpu_ctx->exp_info.old_exp == EXP_PF && (curr_contributory || (idx == EXP_PF)))) {
+		cpu_ctx->exp_info.exp_data.code = 0;
+		cpu_ctx->exp_info.exp_data.eip = 0;
+		idx = EXP_DF;
+	}
+
+	if (curr_contributory || (idx == EXP_PF) || (idx == EXP_DF)) {
+		cpu_ctx->exp_info.old_exp = idx;
+	}
+
+	cpu_ctx->exp_info.exp_data.idx = idx;
+}
+
+template<bool is_int>
+translated_code_t *cpu_raise_exception(cpu_ctx_t *cpu_ctx)
+{
+	check_dbl_exp(cpu_ctx);
+
+	cpu_t *cpu = cpu_ctx->cpu;
+	uint32_t fault_addr = cpu_ctx->exp_info.exp_data.fault_addr;
+	uint16_t code = cpu_ctx->exp_info.exp_data.code;
+	uint16_t idx = cpu_ctx->exp_info.exp_data.idx;
+	uint32_t eip = cpu_ctx->exp_info.exp_data.eip;
+	uint32_t old_eflags = read_eflags(cpu);
+
+	if (cpu_ctx->hflags & HFLG_PE_MODE) {
+		// protected mode
+
+		if (idx * 8 + 7 > cpu_ctx->regs.idtr_hidden.limit) {
+			cpu_ctx->exp_info.exp_data.code = idx * 8 + 2;
+			cpu_ctx->exp_info.exp_data.idx = EXP_GP;
+			return cpu_raise_exception(cpu_ctx);
+		}
+
+		uint64_t desc = mem_read<uint64_t>(cpu, cpu_ctx->regs.idtr_hidden.base + idx * 8, eip, 2);
+		uint16_t type = (desc >> 40) & 0x1F;
+		uint32_t new_eip, eflags;
+		switch (type)
+		{
+		case 5:  // task gate
+			// we don't support task gates yet, so just abort
+			LIB86CPU_ABORT_msg("Task gates are not supported yet while delivering an exception");
+
+		case 6:  // interrupt gate, 16 bit
+		case 14: // interrupt gate, 32 bit
+			eflags = cpu_ctx->regs.eflags & ~IF_MASK;
+			new_eip = ((desc & 0xFFFF000000000000) >> 32) | (desc & 0xFFFF);
+			break;
+
+		case 7:  // trap gate, 16 bit
+		case 15: // trap gate, 32 bit
+			eflags = cpu_ctx->regs.eflags;
+			new_eip = ((desc & 0xFFFF000000000000) >> 32) | (desc & 0xFFFF);
+			break;
+
+		default:
+			cpu_ctx->exp_info.exp_data.code = idx * 8 + 2;
+			cpu_ctx->exp_info.exp_data.idx = EXP_GP;
+			return cpu_raise_exception(cpu_ctx);
+		}
+
+		uint32_t dpl = (desc & SEG_DESC_DPL) >> 45;
+		uint32_t cpl = cpu_ctx->hflags & HFLG_CPL;
+		if (is_int && (dpl < cpl)) {
+			cpu_ctx->exp_info.exp_data.code = idx * 8 + 2;
+			cpu_ctx->exp_info.exp_data.idx = EXP_GP;
+			return cpu_raise_exception(cpu_ctx);
+		}
+
+		if ((desc & SEG_DESC_P) == 0) {
+			cpu_ctx->exp_info.exp_data.code = idx * 8 + 2;
+			cpu_ctx->exp_info.exp_data.idx = EXP_NP;
+			return cpu_raise_exception(cpu_ctx);
+		}
+
+		uint16_t sel = (desc & 0xFFFF0000) >> 16;
+		if ((sel >> 2) == 0) {
+			cpu_ctx->exp_info.exp_data.code = 0;
+			cpu_ctx->exp_info.exp_data.idx = EXP_GP;
+			return cpu_raise_exception(cpu_ctx);
+		}
+
+		addr_t code_desc_addr;
+		uint64_t code_desc;
+		if (read_seg_desc_helper(cpu, sel, code_desc_addr, code_desc, eip)) {
+			return cpu_raise_exception(cpu_ctx);
+		}
+
+		dpl = (code_desc & SEG_DESC_DPL) >> 45;
+		if (dpl > cpl) {
+			cpu_ctx->exp_info.exp_data.code = sel & 0xFFFC;
+			cpu_ctx->exp_info.exp_data.idx = EXP_GP;
+			return cpu_raise_exception(cpu_ctx);
+		}
+
+		if ((code_desc & SEG_DESC_P) == 0) {
+			cpu_ctx->exp_info.exp_data.code = sel & 0xFFFC;
+			cpu_ctx->exp_info.exp_data.idx = EXP_NP;
+			return cpu_raise_exception(cpu_ctx);
+		}
+
+		if (code_desc & SEG_DESC_C) {
+			dpl = cpl;
+		}
+
+		set_access_flg_seg_desc_helper(cpu, code_desc, code_desc_addr, eip);
+
+		uint32_t seg_base = read_seg_desc_base_helper(cpu, code_desc);
+		uint32_t seg_limit = read_seg_desc_limit_helper(cpu, code_desc);
+		uint32_t seg_flags = read_seg_desc_flags_helper(cpu, code_desc);
+		uint32_t stack_switch, stack_mask, stack_base, esp;
+		uint32_t new_esp;
+		uint16_t new_ss;
+		addr_t ss_desc_addr;
+		uint64_t ss_desc;
+
+		if (dpl < cpl) {
+			// more privileged
+
+			if (read_stack_ptr_from_tss_helper(cpu, dpl, new_esp, new_ss, eip)) {
+				return cpu_raise_exception(cpu_ctx);
+			}
+
+			if ((new_ss >> 2) == 0) {
+				cpu_ctx->exp_info.exp_data.code = new_ss & 0xFFFC;
+				cpu_ctx->exp_info.exp_data.idx = EXP_TS;
+				return cpu_raise_exception(cpu_ctx);
+			}
+
+			if (read_seg_desc_helper(cpu, new_ss, ss_desc_addr, ss_desc, eip)) {
+				// code already written by read_seg_desc_helper
+				cpu_ctx->exp_info.exp_data.idx = EXP_TS;
+				return cpu_raise_exception(cpu_ctx);
+			}
+
+			uint32_t p = (ss_desc & SEG_DESC_P) >> 40;
+			uint32_t s = (ss_desc & SEG_DESC_S) >> 44;
+			uint32_t d = (ss_desc & SEG_DESC_DC) >> 42;
+			uint32_t w = (ss_desc & SEG_DESC_W) >> 39;
+			uint32_t ss_dpl = (ss_desc & SEG_DESC_DPL) >> 42;
+			uint32_t ss_rpl = (new_ss & 3) << 5;
+			if ((s | d | w | ss_dpl | ss_rpl | p) ^ ((0x85 | (dpl << 3)) | (dpl << 5))) {
+				cpu_ctx->exp_info.exp_data.code = new_ss & 0xFFFC;
+				cpu_ctx->exp_info.exp_data.idx = EXP_TS;
+				return cpu_raise_exception(cpu_ctx);
+			}
+
+			set_access_flg_seg_desc_helper(cpu, ss_desc, ss_desc_addr, eip);
+
+			stack_switch = 1;
+			stack_mask = ss_desc & SEG_DESC_DB ? 0xFFFFFFFF : 0xFFFF;
+			stack_base = read_seg_desc_base_helper(cpu, ss_desc);
+			esp = new_esp;
+		}
+		else { // same privilege
+			stack_switch = 0;
+			stack_mask = cpu_ctx->hflags & HFLG_SS32 ? 0xFFFFFFFF : 0xFFFF;
+			stack_base = cpu_ctx->regs.ss_hidden.base;
+			esp = cpu_ctx->regs.esp;
+		}
+
+		uint8_t has_code;
+		switch (idx)
+		{
+		case EXP_DF:
+		case EXP_TS:
+		case EXP_NP:
+		case EXP_SS:
+		case EXP_GP:
+		case EXP_PF:
+		case EXP_AC:
+			has_code = 1;
+			break;
+
+		default:
+			has_code = 0;
+		}
+
+		type >>= 3;
+		if (stack_switch) {
+			if (type) { // push 32, priv
+				esp -= 4;
+				mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.ss, eip, 2);
+				esp -= 4;
+				mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.esp, eip, 2);
+				esp -= 4;
+				mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), old_eflags, eip, 2);
+				esp -= 4;
+				mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 2);
+				esp -= 4;
+				mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), eip, eip, 2);
+				if (has_code) {
+					esp -= 4;
+					mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), code, eip, 2);
+				}
+			}
+			else { // push 16, priv
+				esp -= 2;
+				mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.ss, eip, 2);
+				esp -= 2;
+				mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.esp, eip, 2);
+				esp -= 2;
+				mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), old_eflags, eip, 2);
+				esp -= 2;
+				mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 2);
+				esp -= 2;
+				mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), eip, eip, 2);
+				if (has_code) {
+					esp -= 2;
+					mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), code, eip, 2);
+				}
+			}
+
+			uint32_t ss_flags = read_seg_desc_flags_helper(cpu, ss_desc);
+			cpu_ctx->regs.ss = (new_ss & ~3) | dpl;
+			cpu_ctx->regs.ss_hidden.base = stack_base;
+			cpu_ctx->regs.ss_hidden.limit = read_seg_desc_limit_helper(cpu, ss_desc);
+			cpu_ctx->regs.ss_hidden.flags = ss_flags;
+			cpu_ctx->hflags = ((ss_flags & SEG_HIDDEN_DB) >> 19) | (cpu_ctx->hflags & ~HFLG_SS32);
+		}
+		else {
+			if (type) { // push 32, not priv
+				esp -= 4;
+				mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), old_eflags, eip, 0);
+				esp -= 4;
+				mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 0);
+				esp -= 4;
+				mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), eip, eip, 0);
+				if (has_code) {
+					esp -= 4;
+					mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), code, eip, 0);
+				}
+			}
+			else { // push 16, not priv
+				esp -= 2;
+				mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), old_eflags, eip, 0);
+				esp -= 2;
+				mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 0);
+				esp -= 2;
+				mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), eip, eip, 0);
+				if (has_code) {
+					esp -= 2;
+					mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), code, eip, 0);
+				}
+			}
+		}
+
+		cpu_ctx->regs.eflags = (eflags & ~(VM_MASK | RF_MASK | NT_MASK | TF_MASK));
+		cpu_ctx->regs.esp = (cpu_ctx->regs.esp & ~stack_mask) | (esp & stack_mask);
+		cpu_ctx->regs.cs = (sel & ~3) | dpl;
+		cpu_ctx->regs.cs_hidden.base = seg_base;
+		cpu_ctx->regs.cs_hidden.limit = seg_limit;
+		cpu_ctx->regs.cs_hidden.flags = seg_flags;
+		cpu_ctx->hflags = (((seg_flags & SEG_HIDDEN_DB) >> 20) | dpl) | (cpu_ctx->hflags & ~(HFLG_CS32 | HFLG_CPL));
+		cpu_ctx->regs.eip = new_eip;
+		// always clear HFLG_DBG_TRAP
+		cpu_ctx->hflags &= ~HFLG_DBG_TRAP;
+		if (idx == EXP_PF) {
+			cpu_ctx->regs.cr2 = fault_addr;
+		}
+		if (idx == EXP_DB) {
+			cpu_ctx->regs.dr7 &= ~DR7_GD_MASK;
+		}
+		cpu_ctx->exp_info.old_exp = EXP_INVALID;
+	}
+	else {
+		// real mode
+
+		if (idx * 4 + 3 > cpu_ctx->regs.idtr_hidden.limit) {
+			cpu_ctx->exp_info.exp_data.code = idx * 8 + 2;
+			cpu_ctx->exp_info.exp_data.idx = EXP_GP;
+			return cpu_raise_exception(cpu_ctx);
+		}
+
+		uint32_t vec_entry = mem_read<uint32_t>(cpu, cpu_ctx->regs.idtr_hidden.base + idx * 4, eip, 0);
+		uint32_t stack_mask = 0xFFFF;
+		uint32_t stack_base = cpu_ctx->regs.ss_hidden.base;
+		uint32_t esp = cpu_ctx->regs.esp;
+		esp -= 2;
+		mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), old_eflags, eip, 0);
+		esp -= 2;
+		mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 0);
+		esp -= 2;
+		mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), eip, eip, 0);
+
+		cpu_ctx->regs.eflags &= ~(AC_MASK | RF_MASK | IF_MASK | TF_MASK);
+		cpu_ctx->regs.esp = (cpu_ctx->regs.esp & ~stack_mask) | (esp & stack_mask);
+		cpu_ctx->regs.cs = vec_entry >> 16;
+		cpu_ctx->regs.cs_hidden.base = cpu_ctx->regs.cs << 4;
+		cpu_ctx->regs.eip = vec_entry & 0xFFFF;
+		// always clear HFLG_DBG_TRAP
+		cpu_ctx->hflags &= ~HFLG_DBG_TRAP;
+		if (idx == EXP_DB) {
+			cpu_ctx->regs.dr7 &= ~DR7_GD_MASK;
+		}
+		cpu_ctx->exp_info.old_exp = EXP_INVALID;
+	}
+
+	return nullptr;
+}
+
+addr_t
 get_pc(cpu_ctx_t *cpu_ctx)
 {
 	return cpu_ctx->regs.cs_hidden.base + cpu_ctx->regs.eip;
@@ -36,82 +353,56 @@ translated_code_t::~translated_code_t()
 	this->cpu->jit->free_code_block(this->ptr_code);
 }
 
-static translated_code_t *
-tc_run_code(cpu_ctx_t *cpu_ctx, translated_code_t *tc)
-{
-	try {
-		// run the translated code
-		return tc->ptr_code(cpu_ctx);
-	}
-	catch (host_exp_t type) {
-		switch (type)
-		{
-		case host_exp_t::pf_exp: {
-			// page fault while excecuting the translated code
-			try {
-				// the exception handler always returns nullptr
-				return cpu_ctx->exp_fn(cpu_ctx);
-			}
-			catch (host_exp_t type) {
-				assert(type == host_exp_t::pf_exp);
-
-				// page fault while delivering another exception
-				// NOTE: we abort because we don't support double/triple faults yet
-				LIB86CPU_ABORT();
-			}
-		}
-		break;
-
-		case host_exp_t::de_exp:
-			// debug exception trap while excecuting the translated code
-			// we first remove the watchpoint for the faulting address, execute the trapping instruction,
-			// reinstall the watchpoint and jump to the debug handler
-			assert(cpu_ctx->exp_info.exp_data.idx == EXP_DB);
-
-			cpu_ctx->cpu->cpu_flags |= (CPU_DISAS_ONE | CPU_DBG_TRAP);
-			cpu_ctx->tlb[cpu_ctx->exp_info.exp_data.fault_addr >> PAGE_SHIFT] &= ~TLB_WATCH;
-			cpu_ctx->regs.eip = cpu_ctx->exp_info.exp_data.eip;
-			tc_invalidate(cpu_ctx, nullptr, get_pc(cpu_ctx), 1, cpu_ctx->regs.eip); // force retranslation
-			[[fallthrough]];
-
-		case host_exp_t::cpu_mode_changed:
-		case host_exp_t::halt_tc:
-			return nullptr;
-
-		default:
-			LIB86CPU_ABORT_msg("Unknown host exception in %s", __func__);
-		}
-	}
-}
-
 static inline uint32_t
 tc_hash(addr_t pc)
 {
 	return pc & (CODE_CACHE_MAX_SIZE - 1);
 }
 
-void
-tc_invalidate(cpu_ctx_t *cpu_ctx, translated_code_t *tc, uint32_t addr, uint8_t size, uint32_t eip)
+template<bool remove_hook>
+void tc_invalidate(cpu_ctx_t *cpu_ctx, addr_t addr, [[maybe_unused]] uint8_t size, [[maybe_unused]] uint32_t eip)
 {
 	bool halt_tc = false;
-	std::vector<std::unordered_set<translated_code_t *>::iterator> tc_to_delete;
+	addr_t phys_addr;
+	uint8_t is_code;
 
-	if ((tc != nullptr) && !(tc->flags & TC_FLG_HOOK) &&
-		!(std::min(addr + size - 1, tc->pc + tc->size - 1) < std::max(addr, tc->pc))) {
-		// worst case: the write overlaps with the tc we are currently executing
-		halt_tc = true;
-		cpu_ctx->cpu->cpu_flags |= (CPU_DISAS_ONE | CPU_ALLOW_CODE_WRITE);
+	if constexpr (remove_hook) {
+		phys_addr = get_write_addr(cpu_ctx->cpu, addr, 2, cpu_ctx->regs.eip, &is_code);
+	}
+	else {
+		if (cpu_ctx->cpu->cpu_flags & CPU_ALLOW_CODE_WRITE) {
+			return;
+		}
+
+		try {
+			phys_addr = get_write_addr(cpu_ctx->cpu, addr, 2, eip, &is_code);
+		}
+		catch (host_exp_t type) {
+			// because all callers of this function translate the address already, this should never happen
+			LIB86CPU_ABORT_msg("Unexpected page fault in %s", __func__);
+		}
 	}
 
 	// find all tc's in the page addr belongs to
-	auto it_map = cpu_ctx->cpu->tc_page_map.find(addr >> PAGE_SHIFT);
+	auto it_map = cpu_ctx->cpu->tc_page_map.find(phys_addr >> PAGE_SHIFT);
 	if (it_map != cpu_ctx->cpu->tc_page_map.end()) {
 		auto it_set = it_map->second.begin();
+		uint32_t flags = (cpu_ctx->hflags & HFLG_CONST) | (cpu_ctx->regs.eflags & EFLAGS_CONST);
+		std::vector<std::unordered_set<translated_code_t *>::iterator> tc_to_delete;
 		// iterate over all tc's found in the page
 		while (it_set != it_map->second.end()) {
 			translated_code_t *tc_in_page = *it_set;
-			// only invalidate the tc if addr is included in the translated address range of the tc
-			if (!(std::min(addr + size - 1, tc_in_page->pc + tc_in_page->size - 1) < std::max(addr, tc_in_page->pc))) {
+			// only invalidate the tc if phys_addr is included in the translated address range of the tc
+			// hook tc's have a zero guest code size, so they are unaffected by guest writes and do not need to be considered by tc_invalidate
+			bool remove_tc;
+			if constexpr (remove_hook) {
+				remove_tc = !tc_in_page->size && (tc_in_page->pc == phys_addr);
+			}
+			else {
+				remove_tc = tc_in_page->size && !(std::min(phys_addr + size - 1, tc_in_page->pc + tc_in_page->size - 1) < std::max(phys_addr, tc_in_page->pc));
+			}
+
+			if (remove_tc) {
 				auto it_list = tc_in_page->linked_tc.begin();
 				// now unlink all other tc's which jump to this tc
 				while (it_list != tc_in_page->linked_tc.end()) {
@@ -127,34 +418,45 @@ tc_invalidate(cpu_ctx_t *cpu_ctx, translated_code_t *tc, uint32_t addr, uint8_t 
 				// delete the found tc from the code cache
 				uint32_t idx = tc_hash(tc_in_page->pc);
 				auto it = cpu_ctx->cpu->code_cache[idx].begin();
-				auto it_prev = it;
-				uint8_t found = 0;
 				while (it != cpu_ctx->cpu->code_cache[idx].end()) {
-					translated_code_t *tc = it->get();
-					if (tc == tc_in_page) {
-						found = 1;
-						if (it == cpu_ctx->cpu->code_cache[idx].begin()) {
-							cpu_ctx->cpu->code_cache[idx].pop_front();
+					if (it->get() == tc_in_page) {
+						try {
+							if (it->get()->cs_base == cpu_ctx->regs.cs_hidden.base &&
+								it->get()->pc == get_code_addr(cpu_ctx->cpu, get_pc(cpu_ctx), cpu_ctx->regs.eip) &&
+								it->get()->cpu_flags == flags) {
+								// worst case: the write overlaps with the tc we are currently executing
+								halt_tc = true;
+								if constexpr (!remove_hook) {
+									cpu_ctx->cpu->cpu_flags |= (CPU_DISAS_ONE | CPU_ALLOW_CODE_WRITE);
+								}
+							}
 						}
-						else {
-							cpu_ctx->cpu->code_cache[idx].erase_after(it_prev);
+						catch (host_exp_t type) {
+							// the current tc cannot fault
 						}
+						cpu_ctx->cpu->code_cache[idx].erase(it);
 						cpu_ctx->cpu->num_tc--;
 						break;
 					}
-					it_prev = it;
 					it++;
 				}
 
-				assert(found);
 				// we can't delete the tc in tc_page_map right now because it would invalidate its iterator, which is still needed below
 				tc_to_delete.push_back(it_set);
+
+				if constexpr (remove_hook) {
+					break;
+				}
 			}
 			it_set++;
 		}
 
-		// delete the found tc's from the tc_page_map
+		// delete the found tc's from tc_page_map and ibtc
 		for (auto &it : tc_to_delete) {
+			auto it_ibtc = cpu_ctx->cpu->ibtc.find((*it)->virt_pc);
+			if (it_ibtc != cpu_ctx->cpu->ibtc.end()) {
+				cpu_ctx->cpu->ibtc.erase(it_ibtc);
+			}
 			it_map->second.erase(it);
 		}
 
@@ -167,15 +469,20 @@ tc_invalidate(cpu_ctx_t *cpu_ctx, translated_code_t *tc, uint32_t addr, uint8_t 
 
 	if (halt_tc) {
 		// in this case the tc we were executing has been destroyed and thus we must return to the translator with an exception
-		cpu_ctx->regs.eip = eip;
+		if constexpr (!remove_hook) {
+			cpu_ctx->regs.eip = eip;
+		}
 		throw host_exp_t::halt_tc;
 	}
 }
 
+template void tc_invalidate<true>(cpu_ctx_t *cpu_ctx, addr_t addr, [[maybe_unused]] uint8_t size, [[maybe_unused]] uint32_t eip);
+template void tc_invalidate<false>(cpu_ctx_t *cpu_ctx, addr_t addr, [[maybe_unused]] uint8_t size, [[maybe_unused]] uint32_t eip);
+
 static translated_code_t *
 tc_cache_search(cpu_t *cpu, addr_t pc)
 {
-	uint32_t flags = cpu->cpu_ctx.hflags | (cpu->cpu_ctx.regs.eflags & (TF_MASK | IOPL_MASK | RF_MASK | AC_MASK));
+	uint32_t flags = (cpu->cpu_ctx.hflags & HFLG_CONST) | (cpu->cpu_ctx.regs.eflags & EFLAGS_CONST);
 	uint32_t idx = tc_hash(pc);
 	auto it = cpu->code_cache[idx].begin();
 	while (it != cpu->code_cache[idx].end()) {
@@ -192,23 +499,33 @@ tc_cache_search(cpu_t *cpu, addr_t pc)
 }
 
 static void
-tc_cache_insert(cpu_t *cpu, addr_t pc, std::shared_ptr<translated_code_t> &&tc)
+tc_cache_insert(cpu_t *cpu, addr_t pc, std::unique_ptr<translated_code_t> &&tc)
 {
 	cpu->num_tc++;
-	if (!(tc->flags & TC_FLG_HOOK)) {
-		cpu->tc_page_map[pc >> PAGE_SHIFT].insert(tc.get());
-	}
+	cpu->tc_page_map[pc >> PAGE_SHIFT].insert(tc.get());
 	cpu->code_cache[tc_hash(pc)].push_front(std::move(tc));
 }
 
-static void
+void
 tc_cache_clear(cpu_t *cpu)
 {
+	// Use this when you want to destroy all code sections but leave intact the data sections instead. E.g: on x86-64, you'll want to keep the .pdata sections
+	// when this is called from a function called from the JITed code, and the current function can potentially throw an exception
 	cpu->num_tc = 0;
 	cpu->tc_page_map.clear();
+	cpu->ibtc.clear();
 	for (auto &bucket : cpu->code_cache) {
 		bucket.clear();
 	}
+}
+
+void
+tc_cache_purge(cpu_t *cpu)
+{
+	// This is like tc_cache_clear, but it also frees all the non-code sections. E.g: on x86-64, llvm also emits .pdata sections that hold the exception tables
+	// necessary to unwind the stack of the JITed functions
+	tc_cache_clear(cpu);
+	g_mapper.destroy_all_blocks();
 }
 
 static void
@@ -225,17 +542,17 @@ tc_link_direct(translated_code_t *prev_tc, translated_code_t *ptr_tc)
 	case 2:
 		switch ((prev_tc->flags & TC_FLG_JMP_TAKEN) >> 4)
 		{
-		case TC_FLG_DST_PC:
+		case TC_JMP_DST_PC:
 			prev_tc->jmp_offset[0] = ptr_tc->ptr_code;
 			ptr_tc->linked_tc.push_front(prev_tc);
 			break;
 
-		case TC_FLG_NEXT_PC:
+		case TC_JMP_NEXT_PC:
 			prev_tc->jmp_offset[1] = ptr_tc->ptr_code;
 			ptr_tc->linked_tc.push_front(prev_tc);
 			break;
 
-		case TC_FLG_RET:
+		case TC_JMP_RET:
 			if (num_jmp == 1) {
 				break;
 			}
@@ -270,212 +587,6 @@ tc_link_dst_only(translated_code_t *prev_tc, translated_code_t *ptr_tc)
 }
 
 static void
-create_tc_prologue(cpu_t *cpu)
-{
-	// create the translation function, it will hold all the translated code
-	StructType *cpu_ctx_struct_type = StructType::create(CTX(), "struct.cpu_ctx_t");
-	std::vector<Type *> type_struct_exp_data_t_fields;
-	type_struct_exp_data_t_fields.push_back(getIntegerType(32));
-	type_struct_exp_data_t_fields.push_back(getIntegerType(16));
-	type_struct_exp_data_t_fields.push_back(getIntegerType(16));
-	type_struct_exp_data_t_fields.push_back(getIntegerType(32));
-	StructType *type_exp_data_t = StructType::create(CTX(),
-		type_struct_exp_data_t_fields, "struct.exp_data_t", false);
-
-	std::vector<Type*> type_struct_exp_info_t_fields;
-	type_struct_exp_info_t_fields.push_back(type_exp_data_t);
-	type_struct_exp_info_t_fields.push_back(getIntegerType(8));
-	StructType* type_exp_info_t = StructType::create(CTX(),
-		type_struct_exp_info_t_fields, "struct.exp_info_t", false);
-
-	StructType *tc_struct_type = StructType::create(CTX(), "struct.tc_t");  // NOTE: opaque tc struct
-	FunctionType *type_exp_t = FunctionType::get(
-		getPointerType(tc_struct_type),       // tc ret
-		getPointerType(cpu_ctx_struct_type),  // cpu_ctx
-		false);
-
-	std::vector<Type *> type_struct_cpu_ctx_t_fields;
-	type_struct_cpu_ctx_t_fields.push_back(getPointerType(StructType::create(CTX(), "struct.cpu_t")));  // NOTE: opaque cpu struct
-	type_struct_cpu_ctx_t_fields.push_back(get_struct_reg(cpu));
-	type_struct_cpu_ctx_t_fields.push_back(get_struct_eflags(cpu));
-	type_struct_cpu_ctx_t_fields.push_back(getIntegerType(32));
-	type_struct_cpu_ctx_t_fields.push_back(getArrayType(getIntegerType(32), TLB_MAX_SIZE));
-	type_struct_cpu_ctx_t_fields.push_back(getPointerType(getIntegerType(8)));
-	type_struct_cpu_ctx_t_fields.push_back(getPointerType(type_exp_t));
-	type_struct_cpu_ctx_t_fields.push_back(type_exp_info_t);
-	cpu_ctx_struct_type->setBody(type_struct_cpu_ctx_t_fields, false);
-	PointerType *type_pcpu_ctx_t = getPointerType(cpu_ctx_struct_type);
-
-	FunctionType *type_entry_t = FunctionType::get(
-		getPointerType(tc_struct_type),   // tc ret
-		type_pcpu_ctx_t,                  // cpu_ctx arg
-		false);
-
-	Function *func = Function::Create(
-		type_entry_t,                        // func type
-		GlobalValue::ExternalLinkage,        // linkage
-		"main",                              // name
-		cpu->mod);
-	func->setCallingConv(CallingConv::C);
-
-	cpu->bb = BasicBlock::Create(CTX(), "", func, 0);
-	cpu->ptr_cpu_ctx = cpu->bb->getParent()->arg_begin();
-	cpu->ptr_cpu_ctx->setName("cpu_ctx");
-	cpu->ptr_regs = GEP(cpu->ptr_cpu_ctx, 1);
-	cpu->ptr_regs->setName("regs");
-	cpu->ptr_eflags = GEP(cpu->ptr_cpu_ctx, 2);
-	cpu->ptr_eflags->setName("eflags");
-	cpu->ptr_hflags = GEP(cpu->ptr_cpu_ctx, 3);
-	cpu->ptr_hflags->setName("hflags");
-	cpu->ptr_tlb = GEP(cpu->ptr_cpu_ctx, 4);
-	cpu->ptr_tlb->setName("tlb");
-	cpu->ptr_ram = LD(GEP(cpu->ptr_cpu_ctx, 5));
-	cpu->ptr_ram->setName("ram");
-	cpu->ptr_exp_fn = LD(GEP(cpu->ptr_cpu_ctx, 6));
-	cpu->ptr_exp_fn->setName("exp_fn");
-}
-
-static void
-create_tc_epilogue(cpu_t *cpu)
-{
-	Value *tc_ptr1 = new IntToPtrInst(INTPTR(cpu->tc), cpu->bb->getParent()->getReturnType(), "", cpu->bb);
-	ReturnInst::Create(CTX(), tc_ptr1, cpu->bb);
-
-	// create the function that returns to the translator
-	Function *exit = Function::Create(
-		cpu->bb->getParent()->getFunctionType(),  // func type
-		GlobalValue::ExternalLinkage,             // linkage
-		"exit",                                   // name
-		cpu->mod);
-	exit->setCallingConv(CallingConv::C);
-
-	BasicBlock *bb = BasicBlock::Create(CTX(), "", exit, 0);
-	Value *tc_ptr2 = new IntToPtrInst(INTPTR(cpu->tc), exit->getReturnType(), "", bb);
-	ReturnInst::Create(CTX(), tc_ptr2, bb);
-}
-
-uint8_t
-cpu_update_crN(cpu_ctx_t *cpu_ctx, uint32_t new_cr, uint8_t idx, uint32_t eip, uint32_t bytes)
-{
-	switch (idx)
-	{
-	case 0:
-		if (((new_cr & CR0_PE_MASK) == 0 && (new_cr & CR0_PG_MASK) >> 31 == 1) ||
-			((new_cr & CR0_CD_MASK) == 0 && (new_cr & CR0_NW_MASK) >> 29 == 1)) {
-			return 1;
-		}
-
-		cpu_ctx->hflags = (((new_cr & CR0_EM_MASK) << 3) | (cpu_ctx->hflags & ~HFLG_CR0_EM));
-
-		if ((cpu_ctx->regs.cr0 & CR0_PE_MASK) != (new_cr & CR0_PE_MASK)) {
-			tc_cache_clear(cpu_ctx->cpu);
-			tlb_flush(cpu_ctx->cpu, TLB_zero);
-			if (new_cr & CR0_PE_MASK) {
-				if (cpu_ctx->regs.cs_hidden.flags & SEG_HIDDEN_DB) {
-					cpu_ctx->hflags |= HFLG_CS32;
-				}
-				if (cpu_ctx->regs.ss_hidden.flags & SEG_HIDDEN_DB) {
-					cpu_ctx->hflags |= HFLG_SS32;
-				}
-				cpu_ctx->hflags |= (HFLG_PE_MODE | (cpu_ctx->regs.cs & HFLG_CPL));
-			}
-			else {
-				cpu_ctx->hflags &= ~(HFLG_CPL | HFLG_CS32 | HFLG_SS32 | HFLG_PE_MODE);
-			}
-
-			// since tc_cache_clear has deleted the calling code block, we must return to the translator with an exception
-			cpu_ctx->regs.eip = (eip + bytes);
-			cpu_ctx->regs.cr0 = ((new_cr & CR0_FLG_MASK) | CR0_ET_MASK);
-			cpu_ctx->cpu->jit->free_code_block(cpu_ctx->exp_fn);
-			gen_exp_fn(cpu_ctx->cpu);
-			throw host_exp_t::cpu_mode_changed;
-		}
-
-		if ((cpu_ctx->regs.cr0 & (CR0_WP_MASK | CR0_PG_MASK)) != (new_cr & (CR0_WP_MASK | CR0_PG_MASK))) {
-			tlb_flush(cpu_ctx->cpu, TLB_keep_rc);
-		}
-
-		// mov cr0, reg always terminates the tc, so we must update the eip here
-		cpu_ctx->regs.eip = (eip + bytes);
-		cpu_ctx->regs.cr0 = ((new_cr & CR0_FLG_MASK) | CR0_ET_MASK);
-		break;
-
-	case 3:
-		if (cpu_ctx->regs.cr0 & CR0_PG_MASK) {
-			tlb_flush(cpu_ctx->cpu, TLB_no_g);
-		}
-
-		cpu_ctx->regs.cr3 = (new_cr & CR3_FLG_MASK);
-		break;
-
-	case 4: {
-		if (new_cr & CR4_RES_MASK) {
-			return 1;
-		}
-
-		if (new_cr & CR4_PAE_MASK) {
-			LIB86CPU_ABORT_msg("PAE mode is not supported");
-		}
-
-		if ((cpu_ctx->regs.cr4 & (CR4_PSE_MASK | CR4_PGE_MASK)) != (new_cr & (CR4_PSE_MASK | CR4_PGE_MASK))) {
-			tlb_flush(cpu_ctx->cpu, TLB_keep_rc);
-		}
-
-		cpu_ctx->regs.cr4 = new_cr;
-	}
-	break;
-
-	case 2:
-	default:
-		LIB86CPU_ABORT();
-	}
-
-	return 0;
-}
-
-void
-cpu_msr_read(cpu_ctx_t *cpu_ctx)
-{
-	uint64_t val;
-
-	switch (cpu_ctx->regs.ecx)
-	{
-	case IA32_APIC_BASE:
-		// hardcoded value for now
-		val = 0xFEE00000 | (1 << 11) | (1 << 8);
-		break;
-
-	case IA32_MTRR_PHYSBASE(0):
-	case IA32_MTRR_PHYSBASE(1):
-	case IA32_MTRR_PHYSBASE(2):
-	case IA32_MTRR_PHYSBASE(3):
-	case IA32_MTRR_PHYSBASE(4):
-	case IA32_MTRR_PHYSBASE(5):
-	case IA32_MTRR_PHYSBASE(6):
-	case IA32_MTRR_PHYSBASE(7):
-		val = cpu_ctx->cpu->mtrr.phys_var[(cpu_ctx->regs.ecx - MTRR_PHYSBASE_base) / 2].base;
-		break;
-
-	case IA32_MTRR_PHYSMASK(0):
-	case IA32_MTRR_PHYSMASK(1):
-	case IA32_MTRR_PHYSMASK(2):
-	case IA32_MTRR_PHYSMASK(3):
-	case IA32_MTRR_PHYSMASK(4):
-	case IA32_MTRR_PHYSMASK(5):
-	case IA32_MTRR_PHYSMASK(6):
-	case IA32_MTRR_PHYSMASK(7):
-		val = cpu_ctx->cpu->mtrr.phys_var[(cpu_ctx->regs.ecx - MTRR_PHYSMASK_base) / 2].mask;
-		break;
-
-	default:
-		LIB86CPU_ABORT_msg("Unhandled msr read to register at address 0x%X", cpu_ctx->regs.ecx);
-	}
-
-	cpu_ctx->regs.edx = (val >> 32);
-	cpu_ctx->regs.eax = val;
-}
-
-static void
 cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 {
 	uint8_t translate_next = 1;
@@ -486,20 +597,12 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 	addr_t pc = disas_ctx->virt_pc;
 	// we can use the same indexes for both loads and stores because they have the same order in cpu->ptr_mem_xxfn
 	static const uint8_t fn_idx[3] = { MEM_LD32_idx, MEM_LD16_idx, MEM_LD8_idx };
-	static const uint8_t fn_io_idx[3] = { IO_LD32_idx, IO_LD16_idx, IO_LD8_idx };
 
 	ZydisDecodedInstruction instr;
 	ZydisDecoder decoder;
 	ZyanStatus status;
 
 	init_instr_decoder(disas_ctx, &decoder);
-
-	// clear rf if it was set by the previous tc. Note that the cpu does this after having checked for instr breakpoints but before executing the instr. If we do
-	// this at the end of the tc, it's possible that one of the instr in the tc raise an exp and that wil prevent us from clearing the flag
-	if (cpu->cpu_ctx.regs.eflags & RF_MASK) {
-		assert(disas_ctx->flags & DISAS_FLG_ONE_INSTR);
-		ST(GEP_EFLAGS(), AND(LD(GEP_EFLAGS()), CONST32(~RF_MASK)));
-	}
 
 	do {
 		cpu->instr_eip = CONST32(pc - cpu_ctx->regs.cs_hidden.base);
@@ -508,8 +611,10 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			status = decode_instr(cpu, disas_ctx, &decoder, &instr);
 		}
 		catch (host_exp_t type) {
+			// this happens on instr breakpoints (not int3)
 			assert(type == host_exp_t::de_exp);
 			RAISEin0(EXP_DB);
+			disas_ctx->flags |= DISAS_FLG_DBG_FAULT;
 			return;
 		}
 
@@ -521,9 +626,13 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			disas_ctx->pc += bytes;
 			disas_ctx->virt_pc += bytes;
 
-			LOG(log_level::debug, instr_logfn("0x%08X  ", disas_ctx->virt_pc - bytes, &instr).c_str(), disas_ctx->virt_pc - bytes);
+			// att syntax uses percentage symbols to designate the operands, which will cause an error/crash if we (or the client)
+			// attempts to interpret them as conversion specifiers, so we pass the formatted instruction as an argument
+			LOG(log_level::debug, "0x%08X  %s", disas_ctx->virt_pc - bytes, instr_logfn(disas_ctx->virt_pc - bytes, &instr).c_str());
 		}
 		else {
+			// NOTE: if rf is set, then it means we are translating the instr that caused a breakpoint. However, the exp handler always clears rf on itw own,
+			// which means we do not need to do it again here in the case the original instr raises another kind of exp
 			switch (status)
 			{
 			case ZYDIS_STATUS_BAD_REGISTER:
@@ -551,7 +660,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			case ZYDIS_STATUS_INSTRUCTION_TOO_LONG: {
 				// instruction length > 15 bytes
 				cpu->cpu_flags &= ~(CPU_DISAS_ONE | CPU_ALLOW_CODE_WRITE);
-				volatile addr_t addr = get_code_addr(cpu, disas_ctx->virt_pc + X86_MAX_INSTR_LENGTH, disas_ctx->virt_pc - cpu->cpu_ctx.regs.cs_hidden.base, disas_ctx);
+				volatile addr_t addr = get_code_addr(cpu, disas_ctx->virt_pc + X86_MAX_INSTR_LENGTH, disas_ctx->virt_pc - cpu->cpu_ctx.regs.cs_hidden.base, TLB_CODE, disas_ctx);
 				if (disas_ctx->exp_data.idx == EXP_PF) {
 					disas_ctx->flags |= DISAS_FLG_FETCH_FAULT;
 					RAISEin(disas_ctx->exp_data.fault_addr, disas_ctx->exp_data.code, disas_ctx->exp_data.idx, disas_ctx->exp_data.eip);
@@ -587,21 +696,21 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			std::vector<BasicBlock *> vec_bb = getBBs(3);
 			BR_COND(vec_bb[0], vec_bb[1], OR(ICMP_UGT(AND(LD_R8L(EAX_idx), CONST8(0xF)), CONST8(9)), ICMP_NE(LD_AF(), CONST32(0))));
 			cpu->bb = vec_bb[0];
-			ST_R16(ADD(LD_R16(EAX_idx), CONST16(0x106)), EAX_idx);
+			ST_REG_idx(ADD(LD_R16(EAX_idx), CONST16(0x106)), EAX_idx);
 			ST_FLG_AUX(CONST32(0x80000008));
 			BR_UNCOND(vec_bb[2]);
 			cpu->bb = vec_bb[1];
 			ST_FLG_AUX(CONST32(0));
 			BR_UNCOND(vec_bb[2]);
 			cpu->bb = vec_bb[2];
-			ST_R8L(AND(LD_R8L(EAX_idx), CONST8(0xF)), EAX_idx);
+			ST_REG_idx(AND(LD_R8L(EAX_idx), CONST8(0xF)), EAX_idx);
 		}
 		break;
 
 		case ZYDIS_MNEMONIC_AAD: {
 			Value *al = LD_R8L(EAX_idx);
 			Value *ah = LD_R8H(EAX_idx);
-			ST_R8L(ADD(al, MUL(ah, CONST8(instr.operands[OPNUM_SINGLE].imm.value.u))), EAX_idx);
+			ST_REG_idx(ADD(al, MUL(ah, CONST8(instr.operands[OPNUM_SINGLE].imm.value.u))), EAX_idx);
 			ST_R8H(CONST8(0), EAX_idx);
 			ST_FLG_RES_ext(LD_R8L(EAX_idx));
 			ST_FLG_AUX(CONST32(0));
@@ -616,7 +725,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			else {
 				Value *al = LD_R8L(EAX_idx);
 				ST_R8H(UDIV(al, CONST8(instr.operands[OPNUM_SINGLE].imm.value.u)), EAX_idx);
-				ST_R8L(UREM(al, CONST8(instr.operands[OPNUM_SINGLE].imm.value.u)), EAX_idx);
+				ST_REG_idx(UREM(al, CONST8(instr.operands[OPNUM_SINGLE].imm.value.u)), EAX_idx);
 				ST_FLG_RES_ext(LD_R8L(EAX_idx));
 				ST_FLG_AUX(CONST32(0));
 			}
@@ -627,7 +736,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			std::vector<BasicBlock *> vec_bb = getBBs(3);
 			BR_COND(vec_bb[0], vec_bb[1], OR(ICMP_UGT(AND(LD_R8L(EAX_idx), CONST8(0xF)), CONST8(9)), ICMP_NE(LD_AF(), CONST32(0))));
 			cpu->bb = vec_bb[0];
-			ST_R16(SUB(LD_R16(EAX_idx), CONST16(6)), EAX_idx);
+			ST_REG_idx(SUB(LD_R16(EAX_idx), CONST16(6)), EAX_idx);
 			ST_R8H(SUB(LD_R8H(EAX_idx), CONST8(1)), EAX_idx);
 			ST_FLG_AUX(CONST32(0x80000008));
 			BR_UNCOND(vec_bb[2]);
@@ -635,7 +744,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			ST_FLG_AUX(CONST32(0));
 			BR_UNCOND(vec_bb[2]);
 			cpu->bb = vec_bb[2];
-			ST_R8L(AND(LD_R8L(EAX_idx), CONST8(0xF)), EAX_idx);
+			ST_REG_idx(AND(LD_R8L(EAX_idx), CONST8(0xF)), EAX_idx);
 		}
 		break;
 
@@ -652,20 +761,20 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				{
 				case SIZE8:
 					src = CONST8(instr.operands[OPNUM_SRC].imm.value.u);
-					rm = GEP_R8L(EAX_idx);
-					dst = LD(rm);
+					rm = GEP_REG_idx(EAX_idx);
+					dst = LD(rm, getIntegerType(8));
 					break;
 
 				case SIZE16:
 					src = CONST16(instr.operands[OPNUM_SRC].imm.value.u);
-					rm = GEP_R16(EAX_idx);
-					dst = LD(rm);
+					rm = GEP_REG_idx(EAX_idx);
+					dst = LD(rm, getIntegerType(16));
 					break;
 
 				case SIZE32:
 					src = CONST32(instr.operands[OPNUM_SRC].imm.value.u);
-					rm = GEP_R32(EAX_idx);
-					dst = LD(rm);
+					rm = GEP_REG_idx(EAX_idx);
+					dst = LD(rm, getIntegerType(32));
 					break;
 
 				default:
@@ -853,7 +962,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			case 0x23: {
 				Value *val, *reg, *rm;
 				reg = GET_OP(OPNUM_DST);
-				GET_RM(OPNUM_SRC, val = LD_REG_val(rm); val = AND(LD(reg), val);, val = LD_MEM(fn_idx[size_mode], rm); val = AND(LD(reg), val););
+				GET_RM(OPNUM_SRC, val = LD_REG_val(rm); val = AND(LD_REG_val(reg), val);, val = LD_MEM(fn_idx[size_mode], rm); val = AND(LD_REG_val(reg), val););
 				ST_REG_val(val, reg);
 				SET_FLG(val, CONST32(0));
 			}
@@ -977,7 +1086,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			int reg_idx = GET_REG_idx(instr.operands[OPNUM_SINGLE].reg.value);
 			Value *temp = LD_R32(reg_idx);
 			temp = INTRINSIC_ty(bswap, getIntegerType(32), temp);
-			ST_R32(temp, reg_idx);
+			ST_REG_idx(temp, reg_idx);
 		}
 		break;
 
@@ -1061,6 +1170,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				uint32_t call_eip = instr.operands[OPNUM_SINGLE].ptr.offset;
 				uint16_t new_sel = instr.operands[OPNUM_SINGLE].ptr.segment;
 				Value *cs, *eip;
+				// cs holds the cpl, so it can be assumed a constant
 				if (size_mode == SIZE16) {
 					cs = CONST16(cpu_ctx->regs.cs);
 					eip = CONST16(ret_eip);
@@ -1071,15 +1181,25 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					eip = CONST32(ret_eip);
 				}
 				if (cpu_ctx->hflags & HFLG_PE_MODE) {
-					lcall_pe_emit(cpu, std::vector<Value *> { CONST16(new_sel), CONST32(call_eip), cs, eip }, size_mode, ret_eip);
+					Function *lcall_helper = cast<Function>(cpu->mod->getOrInsertFunction("lcall_pe_helper", getIntegerType(8), cpu->ptr_cpu_ctx->getType(),
+						getIntegerType(16), getIntegerType(32), getIntegerType(8), getIntegerType(32), getIntegerType(32)).getCallee());
+					CallInst *ci = CallInst::Create(lcall_helper, { cpu->ptr_cpu_ctx, CONST16(new_sel), CONST32(call_eip), CONST8(size_mode), CONST32(ret_eip), cpu->instr_eip }, "", cpu->bb);
+					BasicBlock *bb0 = getBB();
+					BasicBlock *bb1 = getBB();
+					BR_COND(bb0, bb1, ICMP_NE(ci, CONST8(0)));
+					cpu->bb = bb0;
+					CallInst *ci2 = CallInst::Create(cpu->ptr_exp_fn, cpu->ptr_cpu_ctx, "", cpu->bb);
+					ReturnInst::Create(CTX(), ci2, cpu->bb);
+					cpu->bb = bb1;
+					link_indirect_emit(cpu);
 					cpu->tc->flags |= TC_FLG_INDIRECT;
 				}
 				else {
 					MEM_PUSH((std::vector<Value *> { cs, eip }));
 					ST_SEG(CONST16(new_sel), CS_idx);
-					ST_R32(CONST32(call_eip), EIP_idx);
+					ST_REG_idx(CONST32(call_eip), EIP_idx);
 					ST_SEG_HIDDEN(CONST32(static_cast<uint32_t>(new_sel) << 4), CS_idx, SEG_BASE_idx);
-					link_direct_emit(cpu, std::vector <addr_t> { pc, (static_cast<uint32_t>(new_sel) << 4) + call_eip },
+					link_direct_emit(cpu, pc, (static_cast<uint32_t>(new_sel) << 4) + call_eip, nullptr,
 						CONST32((static_cast<uint32_t>(new_sel) << 4) + call_eip));
 					cpu->tc->flags |= TC_FLG_DIRECT;
 				}
@@ -1096,8 +1216,9 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				std::vector<Value *> vec;
 				vec.push_back(size_mode == SIZE16 ? CONST16(ret_eip) : CONST32(ret_eip));
 				MEM_PUSH(vec);
-				ST_R32(CONST32(call_eip), EIP_idx);
-				link_direct_emit(cpu, std::vector <addr_t> { pc, cpu_ctx->regs.cs_hidden.base + call_eip, pc + bytes },
+				ST_REG_idx(CONST32(call_eip), EIP_idx);
+				addr_t next_pc = pc + bytes;
+				link_direct_emit(cpu, pc, cpu_ctx->regs.cs_hidden.base + call_eip, &next_pc,
 					CONST32(cpu_ctx->regs.cs_hidden.base + call_eip));
 				cpu->tc->flags |= TC_FLG_DIRECT;
 			}
@@ -1114,7 +1235,8 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					if (size_mode == SIZE16) {
 						call_eip = ZEXT32(call_eip);
 					}
-					ST_R32(call_eip, EIP_idx);
+					ST_REG_idx(call_eip, EIP_idx);
+					link_indirect_emit(cpu);
 					cpu->tc->flags |= TC_FLG_INDIRECT;
 				}
 				else if (instr.raw.modrm.reg == 3) {
@@ -1122,6 +1244,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 					Value *cs, *eip, *call_eip, *call_cs, *cs_addr, *offset_addr = GET_OP(OPNUM_SINGLE);
 					addr_t ret_eip = (pc - cpu_ctx->regs.cs_hidden.base) + bytes;
+					// cs holds the cpl, so it can be assumed a constant
 					if (size_mode == SIZE16) {
 						Value *temp = LD_MEM(MEM_LD16_idx, offset_addr);
 						call_eip = ZEXT32(temp);
@@ -1137,7 +1260,16 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					}
 					call_cs = LD_MEM(MEM_LD16_idx, cs_addr);
 					if (cpu_ctx->hflags & HFLG_PE_MODE) {
-						lcall_pe_emit(cpu, std::vector<Value *> { call_cs, call_eip, cs, eip }, size_mode, ret_eip);
+						Function *lcall_helper = cast<Function>(cpu->mod->getOrInsertFunction("lcall_pe_helper", getIntegerType(8), cpu->ptr_cpu_ctx->getType(),
+							getIntegerType(16), getIntegerType(32), getIntegerType(8), getIntegerType(32), getIntegerType(32)).getCallee());
+						CallInst *ci = CallInst::Create(lcall_helper, { cpu->ptr_cpu_ctx, call_cs, call_eip, CONST8(size_mode), CONST32(ret_eip), cpu->instr_eip }, "", cpu->bb);
+						BasicBlock *bb0 = getBB();
+						BasicBlock *bb1 = getBB();
+						BR_COND(bb0, bb1, ICMP_NE(ci, CONST8(0)));
+						cpu->bb = bb0;
+						CallInst *ci2 = CallInst::Create(cpu->ptr_exp_fn, cpu->ptr_cpu_ctx, "", cpu->bb);
+						ReturnInst::Create(CTX(), ci2, cpu->bb);
+						cpu->bb = bb1;
 					}
 					else {
 						std::vector<Value *> vec;
@@ -1145,9 +1277,10 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 						vec.push_back(eip);
 						MEM_PUSH(vec);
 						ST_SEG(call_cs, CS_idx);
-						ST_R32(call_eip, EIP_idx);
+						ST_REG_idx(call_eip, EIP_idx);
 						ST_SEG_HIDDEN(SHL(ZEXT32(call_cs), CONST32(4)), CS_idx, SEG_BASE_idx);
 					}
+					link_indirect_emit(cpu);
 					cpu->tc->flags |= TC_FLG_INDIRECT;
 				}
 				else {
@@ -1165,12 +1298,12 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 		break;
 
 		case ZYDIS_MNEMONIC_CBW: {
-			ST_R16(SEXT16(LD_R8L(EAX_idx)), EAX_idx);
+			ST_REG_idx(SEXT16(LD_R8L(EAX_idx)), EAX_idx);
 		}
 		break;
 
 		case ZYDIS_MNEMONIC_CDQ: {
-			ST_R32(TRUNC32(SHR(SEXT64(LD_R32(EAX_idx)), CONST64(32))), EDX_idx);
+			ST_REG_idx(TRUNC32(SHR(SEXT64(LD_R32(EAX_idx)), CONST64(32))), EDX_idx);
 		}
 		break;
 
@@ -1187,7 +1320,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 			Value *eflags = LD_R32(EFLAGS_idx);
 			eflags = AND(eflags, CONST32(~DF_MASK));
-			ST_R32(eflags, EFLAGS_idx);
+			ST_REG_idx(eflags, EFLAGS_idx);
 		}
 		break;
 
@@ -1200,7 +1333,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				// we don't support virtual 8086 mode, so we don't need to check for it
 				if (((cpu->cpu_ctx.regs.eflags & IOPL_MASK) >> 12) >= (cpu->cpu_ctx.hflags & HFLG_CPL)) {
 					eflags = AND(eflags, CONST32(~IF_MASK));
-					ST_R32(eflags, EFLAGS_idx);
+					ST_REG_idx(eflags, EFLAGS_idx);
 				}
 				else {
 					RAISEin0(EXP_GP);
@@ -1209,7 +1342,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			}
 			else {
 				eflags = AND(eflags, CONST32(~IF_MASK));
-				ST_R32(eflags, EFLAGS_idx);
+				ST_REG_idx(eflags, EFLAGS_idx);
 			}
 		}
 		break;
@@ -1451,9 +1584,9 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 				cpu->bb = vec_bb[0];
 				Value *esi_sum = ADD(esi, val);
-				addr_mode == ADDR16 ? ST_R16(TRUNC16(esi_sum), ESI_idx) : ST_R32(esi_sum, ESI_idx);
+				addr_mode == ADDR16 ? ST_REG_idx(TRUNC16(esi_sum), ESI_idx) : ST_REG_idx(esi_sum, ESI_idx);
 				Value *edi_sum = ADD(edi, val);
-				addr_mode == ADDR16 ? ST_R16(TRUNC16(edi_sum), EDI_idx) : ST_R32(edi_sum, EDI_idx);
+				addr_mode == ADDR16 ? ST_REG_idx(TRUNC16(edi_sum), EDI_idx) : ST_REG_idx(edi_sum, EDI_idx);
 				if (instr.attributes & ZYDIS_ATTRIB_HAS_REPNZ) {
 					REPNZ();
 				}
@@ -1466,9 +1599,9 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 				cpu->bb = vec_bb[1];
 				Value *esi_sub = SUB(esi, val);
-				addr_mode == ADDR16 ? ST_R16(TRUNC16(esi_sub), ESI_idx) : ST_R32(esi_sub, ESI_idx);
+				addr_mode == ADDR16 ? ST_REG_idx(TRUNC16(esi_sub), ESI_idx) : ST_REG_idx(esi_sub, ESI_idx);
 				Value *edi_sub = SUB(edi, val);
-				addr_mode == ADDR16 ? ST_R16(TRUNC16(edi_sub), EDI_idx) : ST_R32(edi_sub, EDI_idx);
+				addr_mode == ADDR16 ? ST_REG_idx(TRUNC16(edi_sub), EDI_idx) : ST_REG_idx(edi_sub, EDI_idx);
 				if (instr.attributes & ZYDIS_ATTRIB_HAS_REPNZ) {
 					REPNZ();
 				}
@@ -1493,12 +1626,12 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 		case ZYDIS_MNEMONIC_CMPXCHG:     BAD;
 		case ZYDIS_MNEMONIC_CPUID:       BAD;
 		case ZYDIS_MNEMONIC_CWD: {
-			ST_R16(TRUNC16(SHR(SEXT32(LD_R16(EAX_idx)), CONST32(16))), EDX_idx);
+			ST_REG_idx(TRUNC16(SHR(SEXT32(LD_R16(EAX_idx)), CONST32(16))), EDX_idx);
 		}
 		break;
 
 		case ZYDIS_MNEMONIC_CWDE: {
-			ST_R32(SEXT32(LD_R16(EAX_idx)), EAX_idx);
+			ST_REG_idx(SEXT32(LD_R16(EAX_idx)), EAX_idx);
 		}
 		break;
 
@@ -1510,7 +1643,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			BR_COND(vec_bb[0], vec_bb[1], OR(ICMP_UGT(AND(old_al, CONST8(0xF)), CONST8(9)), ICMP_NE(LD_AF(), CONST32(0))));
 			cpu->bb = vec_bb[0];
 			Value *sum = ADD(old_al, CONST8(6));
-			ST_R8L(sum, EAX_idx);
+			ST_REG_idx(sum, EAX_idx);
 			ST_FLG_AUX(OR(OR(AND(GEN_SUM_VEC8(old_al, CONST8(6), sum), CONST32(0x80000000)), old_cf), CONST32(8)));
 			BR_UNCOND(vec_bb[2]);
 			cpu->bb = vec_bb[1];
@@ -1519,7 +1652,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			cpu->bb = vec_bb[2];
 			BR_COND(vec_bb[3], vec_bb[4], OR(ICMP_UGT(old_al, CONST8(0x99)), ICMP_NE(old_cf, CONST32(0))));
 			cpu->bb = vec_bb[3];
-			ST_R8L(ADD(LD_R8L(EAX_idx), CONST8(0x60)), EAX_idx);
+			ST_REG_idx(ADD(LD_R8L(EAX_idx), CONST8(0x60)), EAX_idx);
 			ST_FLG_AUX(OR(LD_FLG_AUX(), CONST32(0x80000000)));
 			BR_UNCOND(vec_bb[5]);
 			cpu->bb = vec_bb[4];
@@ -1538,7 +1671,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			BR_COND(vec_bb[0], vec_bb[1], OR(ICMP_UGT(AND(old_al, CONST8(0xF)), CONST8(9)), ICMP_NE(LD_AF(), CONST32(0))));
 			cpu->bb = vec_bb[0];
 			Value *sub = SUB(old_al, CONST8(6));
-			ST_R8L(sub, EAX_idx);
+			ST_REG_idx(sub, EAX_idx);
 			ST_FLG_AUX(OR(OR(AND(GEN_SUB_VEC8(old_al, CONST8(6), sub), CONST32(0x80000000)), old_cf), CONST32(8)));
 			BR_UNCOND(vec_bb[2]);
 			cpu->bb = vec_bb[1];
@@ -1547,7 +1680,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			cpu->bb = vec_bb[2];
 			BR_COND(vec_bb[3], vec_bb[4], OR(ICMP_UGT(old_al, CONST8(0x99)), ICMP_NE(old_cf, CONST32(0))));
 			cpu->bb = vec_bb[3];
-			ST_R8L(SUB(LD_R8L(EAX_idx), CONST8(0x60)), EAX_idx);
+			ST_REG_idx(SUB(LD_R8L(EAX_idx), CONST8(0x60)), EAX_idx);
 			ST_FLG_AUX(OR(LD_FLG_AUX(), CONST32(0x80000000)));
 			BR_UNCOND(vec_bb[4]);
 			cpu->bb = vec_bb[4];
@@ -1633,7 +1766,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					div = UDIV(reg, ZEXT16(val));
 					BR_COND(vec_bb[0], vec_bb[2], ICMP_UGT(div, CONST16(0xFF)));
 					cpu->bb = vec_bb[2];
-					ST_REG_val(TRUNC8(div), GEP_R8L(EAX_idx));
+					ST_REG_val(TRUNC8(div), GEP_REG_idx(EAX_idx));
 					ST_REG_val(TRUNC8(UREM(reg, ZEXT16(val))), GEP_R8H(EAX_idx));
 					break;
 
@@ -1648,8 +1781,8 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					div = UDIV(reg, ZEXT32(val));
 					BR_COND(vec_bb[0], vec_bb[2], ICMP_UGT(div, CONST32(0xFFFF)));
 					cpu->bb = vec_bb[2];
-					ST_REG_val(TRUNC16(div), GEP_R16(EAX_idx));
-					ST_REG_val(TRUNC16(UREM(reg, ZEXT32(val))), GEP_R16(EDX_idx));
+					ST_REG_val(TRUNC16(div), GEP_REG_idx(EAX_idx));
+					ST_REG_val(TRUNC16(UREM(reg, ZEXT32(val))), GEP_REG_idx(EDX_idx));
 					break;
 
 				case SIZE32:
@@ -1663,8 +1796,8 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					div = UDIV(reg, ZEXT64(val));
 					BR_COND(vec_bb[0], vec_bb[2], ICMP_UGT(div, CONST64(0xFFFFFFFF)));
 					cpu->bb = vec_bb[2];
-					ST_REG_val(TRUNC32(div), GEP_R32(EAX_idx));
-					ST_REG_val(TRUNC32(UREM(reg, ZEXT64(val))), GEP_R32(EDX_idx));
+					ST_REG_val(TRUNC32(div), GEP_REG_idx(EAX_idx));
+					ST_REG_val(TRUNC32(UREM(reg, ZEXT64(val))), GEP_REG_idx(EDX_idx));
 					break;
 
 				default:
@@ -1689,8 +1822,8 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			{
 			case 0: { // sp, push 32
 				stack_sub = 4;
-				esp_ptr = GEP_R32(ESP_idx);
-				ebp_ptr = GEP_R32(EBP_idx);
+				esp_ptr = GEP_REG_idx(ESP_idx);
+				ebp_ptr = GEP_REG_idx(EBP_idx);
 				ebp_addr = ALLOC32();
 				ST(ebp_addr, ZEXT32(LD_R16(EBP_idx)));
 				frame_esp = OR(ZEXT32(SUB(LD_R16(ESP_idx), CONST16(4))), AND(LD_R32(ESP_idx), CONST32(0xFFFF0000)));
@@ -1700,8 +1833,8 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 			case 1: { // esp, push 32
 				stack_sub = 4;
-				esp_ptr = GEP_R32(ESP_idx);
-				ebp_ptr = GEP_R32(EBP_idx);
+				esp_ptr = GEP_REG_idx(ESP_idx);
+				ebp_ptr = GEP_REG_idx(EBP_idx);
 				ebp_addr = ALLOC32();
 				ST(ebp_addr, LD_R32(EBP_idx));
 				frame_esp = SUB(LD_R32(ESP_idx), CONST32(4));
@@ -1711,8 +1844,8 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 			case 2: { // sp, push 16
 				stack_sub = 2;
-				esp_ptr = GEP_R16(ESP_idx);
-				ebp_ptr = GEP_R16(EBP_idx);
+				esp_ptr = GEP_REG_idx(ESP_idx);
+				ebp_ptr = GEP_REG_idx(EBP_idx);
 				ebp_addr = ALLOC32();
 				ST(ebp_addr, ZEXT32(LD_R16(EBP_idx)));
 				frame_esp = SUB(LD_R16(ESP_idx), CONST16(2));
@@ -1722,8 +1855,8 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 			case 3: { // esp, push 16
 				stack_sub = 2;
-				esp_ptr = GEP_R16(ESP_idx);
-				ebp_ptr = GEP_R16(EBP_idx);
+				esp_ptr = GEP_REG_idx(ESP_idx);
+				ebp_ptr = GEP_REG_idx(EBP_idx);
 				ebp_addr = ALLOC32();
 				ST(ebp_addr, LD_R32(EBP_idx));
 				frame_esp = TRUNC16(SUB(LD_R32(ESP_idx), CONST32(2)));
@@ -1737,8 +1870,8 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 			if (nesting_lv > 0) {
 				for (uint32_t i = 1; i < nesting_lv; ++i) {
-					ST(ebp_addr, SUB(LD(ebp_addr), CONST32(stack_sub)));
-					Value *new_ebp = LD_MEM(fn_idx[size_mode], ADD(LD(ebp_addr), LD_SEG_HIDDEN(SS_idx, SEG_BASE_idx)));
+					ST(ebp_addr, SUB(LD(ebp_addr, getIntegerType(32)), CONST32(stack_sub)));
+					Value *new_ebp = LD_MEM(fn_idx[size_mode], ADD(LD(ebp_addr, getIntegerType(32)), LD_SEG_HIDDEN(SS_idx, SEG_BASE_idx)));
 					args.push_back(new_ebp);
 					push_tot_size += stack_sub;
 				}
@@ -1789,7 +1922,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					div = SDIV(reg, SEXT16(val));
 					BR_COND(vec_bb[0], vec_bb[2], ICMP_NE(div, SEXT16(TRUNC8(div))));
 					cpu->bb = vec_bb[2];
-					ST_REG_val(TRUNC8(div), GEP_R8L(EAX_idx));
+					ST_REG_val(TRUNC8(div), GEP_REG_idx(EAX_idx));
 					ST_REG_val(TRUNC8(SREM(reg, SEXT16(val))), GEP_R8H(EAX_idx));
 					break;
 
@@ -1804,8 +1937,8 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					div = SDIV(reg, SEXT32(val));
 					BR_COND(vec_bb[0], vec_bb[2], ICMP_NE(div, SEXT32(TRUNC16(div))));
 					cpu->bb = vec_bb[2];
-					ST_REG_val(TRUNC16(div), GEP_R16(EAX_idx));
-					ST_REG_val(TRUNC16(SREM(reg, SEXT32(val))), GEP_R16(EDX_idx));
+					ST_REG_val(TRUNC16(div), GEP_REG_idx(EAX_idx));
+					ST_REG_val(TRUNC16(SREM(reg, SEXT32(val))), GEP_REG_idx(EDX_idx));
 					break;
 
 				case SIZE32:
@@ -1819,8 +1952,8 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					div = SDIV(reg, SEXT64(val));
 					BR_COND(vec_bb[0], vec_bb[2], ICMP_NE(div, SEXT64(TRUNC32(div))));
 					cpu->bb = vec_bb[2];
-					ST_REG_val(TRUNC32(div), GEP_R32(EAX_idx));
-					ST_REG_val(TRUNC32(SREM(reg, SEXT64(val))), GEP_R32(EDX_idx));
+					ST_REG_val(TRUNC32(div), GEP_REG_idx(EAX_idx));
+					ST_REG_val(TRUNC32(SREM(reg, SEXT64(val))), GEP_REG_idx(EDX_idx));
 					break;
 
 				default:
@@ -1852,7 +1985,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					reg = LD_R8L(EAX_idx);
 					GET_RM(OPNUM_SINGLE, val = LD_REG_val(rm);, val = LD_MEM(fn_idx[size_mode], rm););
 					out = MUL(SEXT16(reg), SEXT16(val));
-					ST_REG_val(out, GEP_R16(EAX_idx));
+					ST_REG_val(out, GEP_REG_idx(EAX_idx));
 					ST_FLG_AUX(SHL(ZEXT32(NOT_ZERO(16, XOR(SEXT16(LD_R8L(EAX_idx)), out))), CONST32(31)));
 					break;
 
@@ -1860,8 +1993,8 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					reg = LD_R16(EAX_idx);
 					GET_RM(OPNUM_SINGLE, val = LD_REG_val(rm);, val = LD_MEM(fn_idx[size_mode], rm););
 					out = MUL(SEXT32(reg), SEXT32(val));
-					ST_REG_val(TRUNC16(SHR(out, CONST32(16))), GEP_R16(EDX_idx));
-					ST_REG_val(TRUNC16(out), GEP_R16(EAX_idx));
+					ST_REG_val(TRUNC16(SHR(out, CONST32(16))), GEP_REG_idx(EDX_idx));
+					ST_REG_val(TRUNC16(out), GEP_REG_idx(EAX_idx));
 					ST_FLG_AUX(SHL(NOT_ZERO(32, XOR(SEXT32(LD_R16(EAX_idx)), out)), CONST32(31)));
 					break;
 
@@ -1869,8 +2002,8 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					reg = LD_R32(EAX_idx);
 					GET_RM(OPNUM_SINGLE, val = LD_REG_val(rm);, val = LD_MEM(fn_idx[size_mode], rm););
 					out = MUL(SEXT64(reg), SEXT64(val));
-					ST_REG_val(TRUNC32(SHR(out, CONST64(32))), GEP_R32(EDX_idx));
-					ST_REG_val(TRUNC32(out), GEP_R32(EAX_idx));
+					ST_REG_val(TRUNC32(SHR(out, CONST64(32))), GEP_REG_idx(EDX_idx));
+					ST_REG_val(TRUNC32(out), GEP_REG_idx(EAX_idx));
 					ST_FLG_AUX(SHL(TRUNC32(NOT_ZERO(64, XOR(SEXT64(LD_R32(EAX_idx)), out))), CONST32(31)));
 					break;
 
@@ -1952,8 +2085,8 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			case 0xE5: {
 				Value *port = GET_IMM8();
 				check_io_priv_emit(cpu, ZEXT32(port), size_mode);
-				Value *val = LD_IO(fn_io_idx[size_mode], ZEXT16(port));
-				size_mode == SIZE16 ? ST_R16(val, EAX_idx) : size_mode == SIZE32 ? ST_R32(val, EAX_idx) : ST_R8L(val, EAX_idx);
+				Value *val = LD_IO(ZEXT16(port));
+				size_mode == SIZE16 ? ST_REG_idx(val, EAX_idx) : size_mode == SIZE32 ? ST_REG_idx(val, EAX_idx) : ST_REG_idx(val, EAX_idx);
 			}
 			break;
 
@@ -1964,8 +2097,8 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			case 0xED: {
 				Value *port = LD_R16(EDX_idx);
 				check_io_priv_emit(cpu, ZEXT32(port), size_mode);
-				Value *val = LD_IO(fn_io_idx[size_mode], port);
-				size_mode == SIZE16 ? ST_R16(val, EAX_idx) : size_mode == SIZE32 ? ST_R32(val, EAX_idx) : ST_R8L(val, EAX_idx);
+				Value *val = LD_IO(port);
+				size_mode == SIZE16 ? ST_REG_idx(val, EAX_idx) : size_mode == SIZE32 ? ST_REG_idx(val, EAX_idx) : ST_REG_idx(val, EAX_idx);
 			}
 			break;
 
@@ -2065,19 +2198,19 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				{
 				case SIZE8:
 					val = CONST32(1);
-					io_val = LD_IO(IO_LD8_idx, port);
+					io_val = LD_IO(port);
 					ST_MEM(MEM_LD8_idx, addr, io_val);
 					break;
 
 				case SIZE16:
 					val = CONST32(2);
-					io_val = LD_IO(IO_LD16_idx, port);
+					io_val = LD_IO(port);
 					ST_MEM(MEM_LD16_idx, addr, io_val);
 					break;
 
 				case SIZE32:
 					val = CONST32(4);
-					io_val = LD_IO(IO_LD32_idx, port);
+					io_val = LD_IO(port);
 					ST_MEM(MEM_LD32_idx, addr, io_val);
 					break;
 
@@ -2090,7 +2223,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 				cpu->bb = vec_bb[0];
 				Value *edi_sum = ADD(edi, val);
-				addr_mode == ADDR16 ? ST_R16(TRUNC16(edi_sum), EDI_idx) : ST_R32(edi_sum, EDI_idx);
+				addr_mode == ADDR16 ? ST_REG_idx(TRUNC16(edi_sum), EDI_idx) : ST_REG_idx(edi_sum, EDI_idx);
 				if (instr.attributes & ZYDIS_ATTRIB_HAS_REP) {
 					REP();
 				}
@@ -2100,7 +2233,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 				cpu->bb = vec_bb[1];
 				Value *edi_sub = SUB(edi, val);
-				addr_mode == ADDR16 ? ST_R16(TRUNC16(edi_sub), EDI_idx) : ST_R32(edi_sub, EDI_idx);
+				addr_mode == ADDR16 ? ST_REG_idx(TRUNC16(edi_sub), EDI_idx) : ST_REG_idx(edi_sub, EDI_idx);
 				if (instr.attributes & ZYDIS_ATTRIB_HAS_REP) {
 					REP();
 				}
@@ -2118,7 +2251,14 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 		}
 		break;
 
-		case ZYDIS_MNEMONIC_INT3:        BAD;
+		case ZYDIS_MNEMONIC_INT3: {
+			// NOTE1: we don't support virtual 8086 mode, so we don't need to check for it
+			// NOTE2: we can't just use RAISEin0 because the eip should point to the instr following int3
+			RAISEisInt(0, 0, EXP_BP, (pc + bytes) - cpu_ctx->regs.cs_hidden.base);
+			translate_next = 0;
+		}
+		break;
+
 		case ZYDIS_MNEMONIC_INT:         BAD;
 		case ZYDIS_MNEMONIC_INTO:        BAD;
 		case ZYDIS_MNEMONIC_INVD:        BAD;
@@ -2128,33 +2268,25 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			assert(instr.opcode == 0xCF);
 
 			if (cpu->cpu_ctx.hflags & HFLG_PE_MODE) {
-				ret_pe_emit(cpu, size_mode, true);
+				Function *iret_helper = cast<Function>(cpu->mod->getOrInsertFunction("iret_pe_helper", getIntegerType(8), cpu->ptr_cpu_ctx->getType(),
+					getIntegerType(8), getIntegerType(32)).getCallee());
+				CallInst *ci = CallInst::Create(iret_helper, { cpu->ptr_cpu_ctx, CONST8(size_mode), cpu->instr_eip }, "", cpu->bb);
+				BasicBlock *bb0 = getBB();
+				BasicBlock *bb1 = getBB();
+				BR_COND(bb0, bb1, ICMP_NE(ci, CONST8(0)));
+				cpu->bb = bb0;
+				CallInst *ci2 = CallInst::Create(cpu->ptr_exp_fn, cpu->ptr_cpu_ctx, "", cpu->bb);
+				ReturnInst::Create(CTX(), ci2, cpu->bb);
+				cpu->bb = bb1;
 			}
 			else {
-				std::vector<Value *> vec = MEM_POP(3);
-				Value *eip = vec[0];
-				Value *cs = vec[1];
-				Value *eflags = vec[2];
-				Value *mask;
-
-				if (size_mode == SIZE16) {
-					eip = ZEXT32(eip);
-					eflags = ZEXT32(eflags);
-					mask = CONST32(NT_MASK | IOPL_MASK | DF_MASK | IF_MASK | TF_MASK);
-				}
-				else {
-					cs = TRUNC16(cs);
-					mask = CONST32(ID_MASK | AC_MASK | RF_MASK | NT_MASK | IOPL_MASK | DF_MASK | IF_MASK | TF_MASK);
-				}
-
-				ST_REG_val(vec[3], vec[4]);
-				ST_R32(eip, EIP_idx);
-				ST_SEG(cs, CS_idx);
-				ST_SEG_HIDDEN(SHL(ZEXT32(cs), CONST32(4)), CS_idx, SEG_BASE_idx);
-				write_eflags(cpu, eflags, mask);
+				Function *iret_helper = cast<Function>(cpu->mod->getOrInsertFunction("iret_real_helper", getVoidType(), cpu->ptr_cpu_ctx->getType(),
+					getIntegerType(8), getIntegerType(32)).getCallee());
+				CallInst::Create(iret_helper, { cpu->ptr_cpu_ctx, CONST8(size_mode), cpu->instr_eip }, "", cpu->bb);
 			}
 
-			cpu->tc->flags |= TC_FLG_INDIRECT;
+			link_ret_emit(cpu);
+			cpu->tc->flags |= TC_FLG_RET;
 			translate_next = 0;
 		}
 		break;
@@ -2287,7 +2419,8 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			BR_UNCOND(vec_bb[2]);
 
 			cpu->bb = vec_bb[2];
-			link_direct_emit(cpu, std::vector <addr_t> { pc, cpu_ctx->regs.cs_hidden.base + jump_eip, pc + bytes }, LD(dst_pc));
+			addr_t next_pc2 = pc + bytes;
+			link_direct_emit(cpu, pc, cpu_ctx->regs.cs_hidden.base + jump_eip, &next_pc2, LD(dst_pc, getIntegerType(32)));
 			cpu->tc->flags |= TC_FLG_DIRECT;
 			translate_next = 0;
 		}
@@ -2302,8 +2435,8 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				if (size_mode == SIZE16) {
 					new_eip &= 0x0000FFFF;
 				}
-				ST_R32(CONST32(new_eip), EIP_idx);
-				link_direct_emit(cpu, std::vector <addr_t> { pc, cpu_ctx->regs.cs_hidden.base + new_eip }, CONST32(cpu_ctx->regs.cs_hidden.base + new_eip));
+				ST_REG_idx(CONST32(new_eip), EIP_idx);
+				link_direct_emit(cpu, pc, cpu_ctx->regs.cs_hidden.base + new_eip, nullptr, CONST32(cpu_ctx->regs.cs_hidden.base + new_eip));
 				cpu->tc->flags |= TC_FLG_DIRECT;
 			}
 			break;
@@ -2312,15 +2445,25 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				addr_t new_eip = instr.operands[OPNUM_SINGLE].ptr.offset;
 				uint16_t new_sel = instr.operands[OPNUM_SINGLE].ptr.segment;
 				if (cpu_ctx->hflags & HFLG_PE_MODE) {
-					ljmp_pe_emit(cpu, CONST16(new_sel), size_mode, new_eip);
+					Function *ljmp_helper = cast<Function>(cpu->mod->getOrInsertFunction("ljmp_pe_helper", getIntegerType(8), cpu->ptr_cpu_ctx->getType(),
+						getIntegerType(16), getIntegerType(8), getIntegerType(32), getIntegerType(32)).getCallee());
+					CallInst *ci = CallInst::Create(ljmp_helper, { cpu->ptr_cpu_ctx, CONST16(new_sel), CONST8(size_mode), CONST32(new_eip), cpu->instr_eip }, "", cpu->bb);
+					BasicBlock *bb0 = getBB();
+					BasicBlock *bb1 = getBB();
+					BR_COND(bb0, bb1, ICMP_NE(ci, CONST8(0)));
+					cpu->bb = bb0;
+					CallInst *ci2 = CallInst::Create(cpu->ptr_exp_fn, cpu->ptr_cpu_ctx, "", cpu->bb);
+					ReturnInst::Create(CTX(), ci2, cpu->bb);
+					cpu->bb = bb1;
+					link_indirect_emit(cpu);
 					cpu->tc->flags |= TC_FLG_INDIRECT;
 				}
 				else {
 					new_eip = size_mode == SIZE16 ? new_eip & 0xFFFF : new_eip;
 					ST_SEG(CONST16(new_sel), CS_idx);
-					ST_R32(CONST32(new_eip), EIP_idx);
+					ST_REG_idx(CONST32(new_eip), EIP_idx);
 					ST_SEG_HIDDEN(CONST32(static_cast<uint32_t>(new_sel) << 4), CS_idx, SEG_BASE_idx);
-					link_direct_emit(cpu, std::vector <addr_t> { pc, (static_cast<uint32_t>(new_sel) << 4) + new_eip }, CONST32((static_cast<uint32_t>(new_sel) << 4) + new_eip));
+					link_direct_emit(cpu, pc, (static_cast<uint32_t>(new_sel) << 4) + new_eip, nullptr, CONST32((static_cast<uint32_t>(new_sel) << 4) + new_eip));
 					cpu->tc->flags |= TC_FLG_DIRECT;
 				}
 			}
@@ -2332,12 +2475,13 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					GET_RM(OPNUM_SINGLE, offset = LD_REG_val(rm); , offset = LD_MEM(fn_idx[size_mode], rm););
 					if (size_mode == SIZE16) {
 						new_eip = ZEXT32(offset);
-						ST_R32(new_eip, EIP_idx);
+						ST_REG_idx(new_eip, EIP_idx);
 					}
 					else {
 						new_eip = offset;
-						ST_R32(new_eip, EIP_idx);
+						ST_REG_idx(new_eip, EIP_idx);
 					}
+					link_indirect_emit(cpu);
 					cpu->tc->flags |= TC_FLG_INDIRECT;
 				}
 				else if (instr.raw.modrm.reg == 5) {
@@ -2397,34 +2541,34 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			switch ((size_mode << 1) | ((cpu->cpu_ctx.hflags & HFLG_SS32) >> SS32_SHIFT))
 			{
 			case 0: { // sp, pop 32
-				ST_R16(LD_R16(EBP_idx), ESP_idx);
+				ST_REG_idx(LD_R16(EBP_idx), ESP_idx);
 				std::vector<Value *> vec_pop = MEM_POP(1);
-				ST_R32(vec_pop[0], EBP_idx);
-				ST_R16(vec_pop[1], ESP_idx);
+				ST_REG_idx(vec_pop[0], EBP_idx);
+				ST_REG_idx(vec_pop[1], ESP_idx);
 			}
 			break;
 
 			case 1: { // esp, pop 32
-				ST_R32(LD_R32(EBP_idx), ESP_idx);
+				ST_REG_idx(LD_R32(EBP_idx), ESP_idx);
 				std::vector<Value *> vec_pop = MEM_POP(1);
-				ST_R32(vec_pop[0], EBP_idx);
-				ST_R32(vec_pop[1], ESP_idx);
+				ST_REG_idx(vec_pop[0], EBP_idx);
+				ST_REG_idx(vec_pop[1], ESP_idx);
 			}
 			break;
 
 			case 2: { // sp, pop 16
-				ST_R16(LD_R16(EBP_idx), ESP_idx);
+				ST_REG_idx(LD_R16(EBP_idx), ESP_idx);
 				std::vector<Value *> vec_pop = MEM_POP(1);
-				ST_R16(vec_pop[0], EBP_idx);
-				ST_R16(vec_pop[1], ESP_idx);
+				ST_REG_idx(vec_pop[0], EBP_idx);
+				ST_REG_idx(vec_pop[1], ESP_idx);
 			}
 			break;
 
 			case 3: { // esp, pop 16
-				ST_R32(LD_R32(EBP_idx), ESP_idx);
+				ST_REG_idx(LD_R32(EBP_idx), ESP_idx);
 				std::vector<Value *> vec_pop = MEM_POP(1);
-				ST_R16(vec_pop[0], EBP_idx);
-				ST_R32(vec_pop[1], ESP_idx);
+				ST_REG_idx(vec_pop[0], EBP_idx);
+				ST_REG_idx(vec_pop[1], ESP_idx);
 			}
 			break;
 
@@ -2434,24 +2578,35 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 		}
 		break;
 
-		case ZYDIS_MNEMONIC_LGDT:
-		case ZYDIS_MNEMONIC_LIDT: {
+		case ZYDIS_MNEMONIC_LGDT: {
+			assert(instr.raw.modrm.reg == 2);
+
 			Value *rm, *limit, *base;
-			uint8_t reg_idx;
-			if (instr.mnemonic == ZYDIS_MNEMONIC_LGDT) {
-				assert(instr.raw.modrm.reg == 2);
-				reg_idx = GDTR_idx;
-			}
-			else {
-				assert(instr.raw.modrm.reg == 3);
-				reg_idx = IDTR_idx;
-			}
 			GET_RM(OPNUM_SINGLE, assert(0);, limit = LD_MEM(MEM_LD16_idx, rm); rm = ADD(rm, CONST32(2)); base = LD_MEM(MEM_LD32_idx, rm););
 			if (size_mode == SIZE16) {
 				base = AND(base, CONST32(0x00FFFFFF));
 			}
-			ST_SEG_HIDDEN(base, reg_idx, SEG_BASE_idx);
-			ST_SEG_HIDDEN(ZEXT32(limit), reg_idx, SEG_LIMIT_idx);
+			ST_SEG_HIDDEN(base, GDTR_idx, SEG_BASE_idx);
+			ST_SEG_HIDDEN(ZEXT32(limit), GDTR_idx, SEG_LIMIT_idx);
+		}
+		break;
+
+		case ZYDIS_MNEMONIC_LIDT: {
+			assert(instr.raw.modrm.reg == 3);
+
+			Value *rm, *limit, *base;
+			GET_RM(OPNUM_SINGLE, assert(0);, limit = LD_MEM(MEM_LD16_idx, rm); rm = ADD(rm, CONST32(2)); base = LD_MEM(MEM_LD32_idx, rm););
+			if (size_mode == SIZE16) {
+				base = AND(base, CONST32(0x00FFFFFF));
+			}
+			ST_SEG_HIDDEN(base, IDTR_idx, SEG_BASE_idx);
+			ST_SEG_HIDDEN(ZEXT32(limit), IDTR_idx, SEG_LIMIT_idx);
+
+			if (cpu->cpu_flags & CPU_DBG_PRESENT) {
+				// hook the breakpoint exception handler so that the debugger can catch it
+				Function *fn = cast<Function>(cpu->mod->getOrInsertFunction("dbg_update_bp_hook", getVoidType(), cpu->ptr_cpu_ctx->getType()).getCallee());
+				CallInst::Create(fn, cpu->ptr_cpu_ctx, "", cpu->bb);
+			}
 		}
 		break;
 
@@ -2464,27 +2619,17 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			}
 			else {
 				Value *sel, *rm;
-				std::vector<BasicBlock *> vec_bb = getBBs(5);
 				GET_RM(OPNUM_SINGLE, sel = LD_REG_val(rm);, sel = LD_MEM(MEM_LD16_idx, rm););
-				BR_COND(vec_bb[0], vec_bb[1], ICMP_EQ(SHR(sel, CONST16(2)), CONST16(0)));
-				cpu->bb = vec_bb[0];
-				write_seg_reg_emit(cpu, LDTR_idx, std::vector<Value *> { sel, CONST32(0), CONST32(0), CONST32(0) });
-				BR_UNCOND(vec_bb[4]);
-				cpu->bb = vec_bb[1];
-				Value *desc = read_seg_desc_emit(cpu, sel)[1];
-				Value *s = SHR(AND(desc, CONST64(SEG_DESC_S)), CONST64(40));
-				Value *ty = SHR(AND(desc, CONST64(SEG_DESC_TY)), CONST64(40));
-				BasicBlock *bb_exp = RAISE(AND(sel, CONST16(0xFFFC)), EXP_GP);
-				BR_COND(bb_exp, vec_bb[2], ICMP_NE(XOR(OR(s, ty), CONST64(SEG_DESC_LDT)), CONST64(0))); // must be ldt type
-				cpu->bb = vec_bb[2];
-				Value *p = AND(desc, CONST64(SEG_DESC_P));
-				bb_exp = RAISE(AND(sel, CONST16(0xFFFC)), EXP_NP);
-				BR_COND(bb_exp, vec_bb[3], ICMP_EQ(p, CONST64(0))); // segment not present
-				cpu->bb = vec_bb[3];
-				write_seg_reg_emit(cpu, LDTR_idx, std::vector<Value *> { sel, read_seg_desc_base_emit(cpu, desc),
-					read_seg_desc_limit_emit(cpu, desc), read_seg_desc_flags_emit(cpu, desc)});
-				BR_UNCOND(vec_bb[4]);
-				cpu->bb = vec_bb[4];
+				Function *ltr_helper = cast<Function>(cpu->mod->getOrInsertFunction("lldt_helper", getIntegerType(8), cpu->ptr_cpu_ctx->getType(),
+					getIntegerType(16), getIntegerType(32)).getCallee());
+				CallInst *ci = CallInst::Create(ltr_helper, { cpu->ptr_cpu_ctx, sel, cpu->instr_eip }, "", cpu->bb);
+				BasicBlock *bb0 = getBB();
+				BasicBlock *bb1 = getBB();
+				BR_COND(bb0, bb1, ICMP_NE(ci, CONST8(0)));
+				cpu->bb = bb0;
+				CallInst *ci2 = CallInst::Create(cpu->ptr_exp_fn, cpu->ptr_cpu_ctx, "", cpu->bb);
+				ReturnInst::Create(CTX(), ci2, cpu->bb);
+				cpu->bb = bb1;
 			}
 		}
 		break;
@@ -2527,19 +2672,19 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				case SIZE8:
 					val = CONST32(1);
 					src = LD_MEM(fn_idx[size_mode], addr);
-					ST_R8L(src, EAX_idx);
+					ST_REG_idx(src, EAX_idx);
 					break;
 
 				case SIZE16:
 					val = CONST32(2);
 					src = LD_MEM(fn_idx[size_mode], addr);
-					ST_R16(src, EAX_idx);
+					ST_REG_idx(src, EAX_idx);
 					break;
 
 				case SIZE32:
 					val = CONST32(4);
 					src = LD_MEM(fn_idx[size_mode], addr);
-					ST_R32(src, EAX_idx);
+					ST_REG_idx(src, EAX_idx);
 					break;
 
 				default:
@@ -2551,7 +2696,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 				cpu->bb = vec_bb[0];
 				Value *esi_sum = ADD(esi, val);
-				addr_mode == ADDR16 ? ST_R16(TRUNC16(esi_sum), ESI_idx) : ST_R32(esi_sum, ESI_idx);
+				addr_mode == ADDR16 ? ST_REG_idx(TRUNC16(esi_sum), ESI_idx) : ST_REG_idx(esi_sum, ESI_idx);
 				if (instr.attributes & ZYDIS_ATTRIB_HAS_REP) {
 					REP();
 				}
@@ -2561,7 +2706,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 				cpu->bb = vec_bb[1];
 				Value *esi_sub = SUB(esi, val);
-				addr_mode == ADDR16 ? ST_R16(TRUNC16(esi_sub), ESI_idx) : ST_R32(esi_sub, ESI_idx);
+				addr_mode == ADDR16 ? ST_REG_idx(TRUNC16(esi_sub), ESI_idx) : ST_REG_idx(esi_sub, ESI_idx);
 				if (instr.attributes & ZYDIS_ATTRIB_HAS_REP) {
 					REP();
 				}
@@ -2605,13 +2750,13 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			{
 			case ADDR16:
 				val = SUB(LD_R16(ECX_idx), CONST16(1));
-				ST_R16(val, ECX_idx);
+				ST_REG_idx(val, ECX_idx);
 				zero = CONST16(0);
 				break;
 
 			case ADDR32:
 				val = SUB(LD_R32(ECX_idx), CONST32(1));
-				ST_R32(val, ECX_idx);
+				ST_REG_idx(val, ECX_idx);
 				zero = CONST32(0);
 				break;
 
@@ -2638,7 +2783,8 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			BR_UNCOND(vec_bb[2]);
 
 			cpu->bb = vec_bb[2];
-			link_direct_emit(cpu, std::vector <addr_t> { pc, cpu_ctx->regs.cs_hidden.base + loop_eip, pc + bytes }, LD(dst_pc));
+			addr_t next_pc = pc + bytes;
+			link_direct_emit(cpu, pc, cpu_ctx->regs.cs_hidden.base + loop_eip, &next_pc, LD(dst_pc, getIntegerType(32)));
 			cpu->tc->flags |= TC_FLG_DIRECT;
 			translate_next = 0;
 		}
@@ -2656,26 +2802,32 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			rm = size_mode == SIZE16 ? ADD(rm, CONST32(2)) : ADD(rm, CONST32(4));
 			sel = LD_MEM(MEM_LD16_idx, rm););
 
+			const char *mov_sel_pe_fn;
 			switch (instr.opcode)
 			{
 			case 0xB2:
 				sel_idx = SS_idx;
+				mov_sel_pe_fn = "mov_ss_pe_helper";
 				break;
 
 			case 0xB4:
 				sel_idx = FS_idx;
+				mov_sel_pe_fn = "mov_fs_pe_helper";
 				break;
 
 			case 0xB5:
 				sel_idx = GS_idx;
+				mov_sel_pe_fn = "mov_gs_pe_helper";
 				break;
 
 			case 0xC4:
 				sel_idx = ES_idx;
+				mov_sel_pe_fn = "mov_es_pe_helper";
 				break;
 
 			case 0xC5:
 				sel_idx = DS_idx;
+				mov_sel_pe_fn = "mov_ds_pe_helper";
 				break;
 
 			default:
@@ -2683,38 +2835,41 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			}
 
 			if (cpu_ctx->hflags & HFLG_PE_MODE) {
-				std::vector<Value *> vec;
-
 				if (sel_idx == SS_idx) {
-					vec = check_ss_desc_priv_emit(cpu, sel);
-					set_access_flg_seg_desc_emit(cpu, vec[1], vec[0]);
-					write_seg_reg_emit(cpu, sel_idx, std::vector<Value *> { sel, read_seg_desc_base_emit(cpu, vec[1]),
-						read_seg_desc_limit_emit(cpu, vec[1]), read_seg_desc_flags_emit(cpu, vec[1])});
+					Function *mov_ss_helper = cast<Function>(cpu->mod->getOrInsertFunction(mov_sel_pe_fn, getIntegerType(8), cpu->ptr_cpu_ctx->getType(),
+						getIntegerType(16), getIntegerType(32)).getCallee());
+					CallInst *ci = CallInst::Create(mov_ss_helper, { cpu->ptr_cpu_ctx, sel, cpu->instr_eip }, "", cpu->bb);
+					BasicBlock *bb0 = getBB();
+					BasicBlock *bb1 = getBB();
+					BR_COND(bb0, bb1, ICMP_NE(ci, CONST8(0)));
+					cpu->bb = bb0;
+					CallInst *ci2 = CallInst::Create(cpu->ptr_exp_fn, cpu->ptr_cpu_ctx, "", cpu->bb);
+					ReturnInst::Create(CTX(), ci2, cpu->bb);
+					cpu->bb = bb1;
 					ST(GEP_EIP(), ADD(cpu->instr_eip, CONST32(bytes)));
 					ST_REG_val(offset, GET_REG(OPNUM_DST));
 					if (((pc + bytes) & ~PAGE_MASK) == (pc & ~PAGE_MASK)) {
-						std:: vector<BasicBlock *> vec_bb = getBBs(2);
-						BR_COND(vec_bb[0], vec_bb[1], ICMP_EQ(CONST32(cpu->cpu_ctx.hflags & HFLG_SS32), AND(LD(cpu->ptr_hflags), CONST32(HFLG_SS32))));
-						cpu->bb = vec_bb[0];
+						BasicBlock *bb2 = getBB();
+						BasicBlock *bb3 = getBB();
+						BR_COND(bb2, bb3, ICMP_EQ(CONST32(cpu->cpu_ctx.hflags & HFLG_SS32), AND(LD(cpu->ptr_hflags, getIntegerType(32)), CONST32(HFLG_SS32))));
+						cpu->bb = bb2;
 						link_dst_only_emit(cpu);
-						cpu->bb = vec_bb[1];
-						cpu->tc->flags |= TC_FLG_DST_ONLY;
+						cpu->bb = bb3;
+						cpu->tc->flags |= TC_FLG_COND_DST_ONLY;
 					}
 					translate_next = 0;
 				}
 				else {
-					std::vector<BasicBlock *> vec_bb = getBBs(3);
-					BR_COND(vec_bb[0], vec_bb[1], ICMP_EQ(SHR(sel, CONST16(2)), CONST16(0)));
-					cpu->bb = vec_bb[0];
-					write_seg_reg_emit(cpu, sel_idx, std::vector<Value *> { sel, CONST32(0), CONST32(0), CONST32(0) });
-					BR_UNCOND(vec_bb[2]);
-					cpu->bb = vec_bb[1];
-					vec = check_seg_desc_priv_emit(cpu, sel);
-					set_access_flg_seg_desc_emit(cpu, vec[1], vec[0]);
-					write_seg_reg_emit(cpu, sel_idx, std::vector<Value *> { sel /* & rpl?? */, read_seg_desc_base_emit(cpu, vec[1]),
-						read_seg_desc_limit_emit(cpu, vec[1]), read_seg_desc_flags_emit(cpu, vec[1])});
-					BR_UNCOND(vec_bb[2]);
-					cpu->bb = vec_bb[2];
+					Function *mov_sel_helper = cast<Function>(cpu->mod->getOrInsertFunction(mov_sel_pe_fn, getIntegerType(8), cpu->ptr_cpu_ctx->getType(),
+						getIntegerType(16), getIntegerType(32)).getCallee());
+					CallInst *ci = CallInst::Create(mov_sel_helper, { cpu->ptr_cpu_ctx, sel, cpu->instr_eip }, "", cpu->bb);
+					BasicBlock *bb0 = getBB();
+					BasicBlock *bb1 = getBB();
+					BR_COND(bb0, bb1, ICMP_NE(ci, CONST8(0)));
+					cpu->bb = bb0;
+					CallInst *ci2 = CallInst::Create(cpu->ptr_exp_fn, cpu->ptr_cpu_ctx, "", cpu->bb);
+					ReturnInst::Create(CTX(), ci2, cpu->bb);
+					cpu->bb = bb1;
 					ST_REG_val(offset, GET_REG(OPNUM_DST));
 				}
 			}
@@ -2735,30 +2890,17 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			}
 			else {
 				Value *sel, *rm;
-				std::vector<BasicBlock *> vec_bb = getBBs(5);
 				GET_RM(OPNUM_SINGLE, sel = LD_REG_val(rm);, sel = LD_MEM(MEM_LD16_idx, rm););
-				BR_COND(vec_bb[0], vec_bb[1], ICMP_EQ(SHR(sel, CONST16(2)), CONST16(0)));
-				cpu->bb = vec_bb[0];
-				write_seg_reg_emit(cpu, TR_idx, std::vector<Value *> { sel, CONST32(0), CONST32(0), CONST32(0) });
-				BR_UNCOND(vec_bb[4]);
-				cpu->bb = vec_bb[1];
-				std::vector<Value *> vec = read_tss_desc_emit(cpu, sel);
-				Value *desc = vec[1];
-				Value *s = SHR(AND(desc, CONST64(SEG_DESC_S)), CONST64(40));
-				Value *ty = SHR(AND(desc, CONST64(SEG_DESC_TY)), CONST64(40));
-				BasicBlock *bb_exp = RAISE(AND(sel, CONST16(0xFFFC)), EXP_GP);
-				Value *val = OR(ICMP_EQ(OR(s, ty), CONST64(SEG_DESC_TSS16AV)), ICMP_EQ(OR(s, ty), CONST64(SEG_DESC_TSS32AV)));
-				BR_COND(bb_exp, vec_bb[2], ICMP_EQ(val, CONSTs(1, 0))); // must be an available tss
-				cpu->bb = vec_bb[2];
-				Value *p = AND(desc, CONST64(SEG_DESC_P));
-				bb_exp = RAISE(AND(sel, CONST16(0xFFFC)), EXP_NP);
-				BR_COND(bb_exp, vec_bb[3], ICMP_EQ(p, CONST64(0))); // segment not present
-				cpu->bb = vec_bb[3];
-				ST_MEM_PRIV(MEM_LD64_idx, vec[0], OR(desc, CONST64(SEG_DESC_BY)));
-				write_seg_reg_emit(cpu, TR_idx, std::vector<Value *> { sel, read_seg_desc_base_emit(cpu, desc),
-					read_seg_desc_limit_emit(cpu, desc), read_seg_desc_flags_emit(cpu, desc)});
-				BR_UNCOND(vec_bb[4]);
-				cpu->bb = vec_bb[4];
+				Function *ltr_helper = cast<Function>(cpu->mod->getOrInsertFunction("ltr_helper", getIntegerType(8), cpu->ptr_cpu_ctx->getType(),
+					getIntegerType(16), getIntegerType(32)).getCallee());
+				CallInst *ci = CallInst::Create(ltr_helper, { cpu->ptr_cpu_ctx, sel, cpu->instr_eip }, "", cpu->bb);
+				BasicBlock *bb0 = getBB();
+				BasicBlock *bb1 = getBB();
+				BR_COND(bb0, bb1, ICMP_NE(ci, CONST8(0)));
+				cpu->bb = bb0;
+				CallInst *ci2 = CallInst::Create(cpu->ptr_exp_fn, cpu->ptr_cpu_ctx, "", cpu->bb);
+				ReturnInst::Create(CTX(), ci2, cpu->bb);
+				cpu->bb = bb1;
 			}
 		}
 		break;
@@ -2772,7 +2914,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					translate_next = 0;
 				}
 				else {
-					ST_R32(LD_REG_val(GET_REG(OPNUM_SRC)), GET_REG_idx(instr.operands[OPNUM_DST].reg.value));
+					ST_REG_idx(LD_REG_val(GET_REG(OPNUM_SRC)), GET_REG_idx(instr.operands[OPNUM_DST].reg.value));
 				}
 			}
 			break;
@@ -2781,7 +2923,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				std::vector<BasicBlock *> vec_bb = getBBs(2);
 				BR_COND(vec_bb[0], vec_bb[1], ICMP_NE(AND(LD_R32(DR7_idx), CONST32(DR7_GD_MASK)), CONST32(0)));
 				cpu->bb = vec_bb[0];
-				ST_R32(OR(LD_R32(DR6_idx), CONST32(DR6_BD_MASK)), DR6_idx); // can't just use RAISE0 because we need to set bd in dr6
+				ST_REG_idx(OR(LD_R32(DR6_idx), CONST32(DR6_BD_MASK)), DR6_idx); // can't just use RAISE0 because we need to set bd in dr6
 				RAISEin0(EXP_DB);
 				UNREACH();
 				cpu->bb = vec_bb[1];
@@ -2797,7 +2939,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 						cpu->bb = bb;
 						dr_offset = 2; // turns dr4/5 to dr6/7
 					}
-					ST_R32(LD_R32(GET_REG_idx(instr.operands[OPNUM_SRC].reg.value) + dr_offset),
+					ST_REG_idx(LD_R32(GET_REG_idx(instr.operands[OPNUM_SRC].reg.value) + dr_offset),
 						GET_REG_idx(instr.operands[OPNUM_DST].reg.value));
 				}
 			}
@@ -2818,8 +2960,8 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 					case ZYDIS_REGISTER_CR3:
 					case ZYDIS_REGISTER_CR4: {
-						Function *crN_fn = cast<Function>(cpu->mod->getOrInsertFunction("cpu_update_crN", getIntegerType(8), cpu->ptr_cpu_ctx->getType(),
-							getIntegerType(32), getIntegerType(8), getIntegerType(32), getIntegerType(32)));
+						Function *crN_fn = cast<Function>(cpu->mod->getOrInsertFunction("update_crN_helper", getIntegerType(8), cpu->ptr_cpu_ctx->getType(),
+							getIntegerType(32), getIntegerType(8), getIntegerType(32), getIntegerType(32)).getCallee());
 						CallInst *ci = CallInst::Create(crN_fn, std::vector<Value *>{ cpu->ptr_cpu_ctx, val, CONST8(GET_REG_idx(instr.operands[OPNUM_DST].reg.value) - CR_offset),
 							cpu->instr_eip, CONST32(bytes) }, "", cpu->bb);
 						std::vector<BasicBlock *> vec_bb = getBBs(1);
@@ -2829,7 +2971,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					break;
 
 					case ZYDIS_REGISTER_CR2:
-						ST_R32(val, CR2_idx);
+						ST_REG_idx(val, CR2_idx);
 						break;
 
 					default:
@@ -2843,7 +2985,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				std::vector<BasicBlock *> vec_bb = getBBs(2);
 				BR_COND(vec_bb[0], vec_bb[1], ICMP_NE(AND(LD_R32(DR7_idx), CONST32(DR7_GD_MASK)), CONST32(0)));
 				cpu->bb = vec_bb[0];
-				ST_R32(OR(LD_R32(DR6_idx), CONST32(DR6_BD_MASK)), DR6_idx); // can't just use RAISE0 because we need to set bd in dr6
+				ST_REG_idx(OR(LD_R32(DR6_idx), CONST32(DR6_BD_MASK)), DR6_idx); // can't just use RAISE0 because we need to set bd in dr6
 				RAISEin0(EXP_DB);
 				UNREACH();
 				cpu->bb = vec_bb[1];
@@ -2864,25 +3006,15 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 						// we cannot just look for the single watchpoint we are updating because it's possible that other watchpoints exist in the same page
 						for (int idx = 0; idx < 4; ++idx) {
 							std::vector<BasicBlock *> vec_bb = getBBs(2);
-							Value *tlb_old_idx = GEP(cpu->ptr_tlb, SHR(LD_R32(idx), CONST32(PAGE_SHIFT)));
-							Value *tlb_new_idx = GEP(cpu->ptr_tlb, SHR(LD(reg), CONST32(PAGE_SHIFT)));
-							ST(tlb_old_idx, AND(LD(tlb_old_idx), CONST32(~TLB_WATCH))); // remove existing watchpoint
+							Value *tlb_old_idx = GEP(cpu->ptr_tlb, getArrayType(getIntegerType(32), TLB_MAX_SIZE), SHR(LD_R32(idx), CONST32(PAGE_SHIFT)));
+							Value *tlb_new_idx = GEP(cpu->ptr_tlb, getArrayType(getIntegerType(32), TLB_MAX_SIZE), SHR(LD(reg, getIntegerType(32)), CONST32(PAGE_SHIFT)));
+							ST(tlb_old_idx, AND(LD(tlb_old_idx, getIntegerType(32)), CONST32(~TLB_WATCH))); // remove existing watchpoint
 							BR_COND(vec_bb[0], vec_bb[1], ICMP_NE(AND(SHR(LD_R32(DR7_idx), CONST32(idx * 2)), CONST32(3)), CONST32(0)));
 							cpu->bb = vec_bb[0];
-							ST(tlb_new_idx, OR(LD(tlb_new_idx), CONST32(TLB_WATCH))); // install new watchpoint if enabled
+							ST(tlb_new_idx, OR(LD(tlb_new_idx, getIntegerType(32)), CONST32(TLB_WATCH))); // install new watchpoint if enabled
 							BR_UNCOND(vec_bb[1]);
 							cpu->bb = vec_bb[1];
 						}
-						// invalidate the tc if it is an instr breakpoint. This, because those are only checked at translation time and not at runtime. If we don't, the existing
-						// tc's will stil break on the old address. Note that this is not a problem for data watchpoints because those are signaled as a flag in the tlb, which is
-						// always checked at runtime by the tc's
-						std::vector<BasicBlock *> vec_bb = getBBs(2);
-						BR_COND(vec_bb[0], vec_bb[1], ICMP_EQ(AND(SHR(LD_R32(DR7_idx), CONST32(DR7_TYPE_SHIFT + (dr_idx - DR_offset) * 4)), CONST32(3)), CONST32(DR7_TYPE_INSTR)));
-						cpu->bb = vec_bb[0];
-						CallInst::Create(cpu->ptr_invtc_fn, std::vector<Value *> { cpu->ptr_cpu_ctx, ConstantExpr::getIntToPtr(INTPTR(cpu->tc), cpu->bb->getParent()->getReturnType()),
-							LD_R32(dr_idx), CONST8(1), cpu->instr_eip }, "", cpu->bb);
-						BR_UNCOND(vec_bb[1]);
-						cpu->bb = vec_bb[1];
 					}
 					break;
 
@@ -2895,7 +3027,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					[[fallthrough]];
 
 					case DR6_idx:
-						ST(reg, OR(LD(reg), CONST32(DR6_RES_MASK)));
+						ST(reg, OR(LD(reg, getIntegerType(32)), CONST32(DR6_RES_MASK)));
 						break;
 
 					case DR5_idx: {
@@ -2907,34 +3039,27 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					[[fallthrough]];
 
 					case DR7_idx: {
-						ST(reg, OR(LD(reg), CONST32(DR7_RES_MASK)));
+						ST(reg, OR(LD(reg, getIntegerType(32)), CONST32(DR7_RES_MASK)));
 						for (int idx = 0; idx < 4; ++idx) {
-							std::vector<BasicBlock *> vec_bb = getBBs(7);
+							std::vector<BasicBlock *> vec_bb = getBBs(5);
 							Value *curr_watch_addr = LD_R32(DR_offset + idx);
-							Value *tlb_idx = GEP(cpu->ptr_tlb, SHR(curr_watch_addr, CONST32(PAGE_SHIFT)));
+							Value *tlb_idx = GEP(cpu->ptr_tlb, getArrayType(getIntegerType(32), TLB_MAX_SIZE), SHR(curr_watch_addr, CONST32(PAGE_SHIFT)));
 							// we don't support task switches, so local and global enable flags are the same for now
-							BR_COND(vec_bb[0], vec_bb[1], ICMP_NE(AND(SHR(LD(reg), CONST32(idx * 2)), CONST32(3)), CONST32(0)));
+							BR_COND(vec_bb[0], vec_bb[1], ICMP_NE(AND(SHR(LD(reg, getIntegerType(32)), CONST32(idx * 2)), CONST32(3)), CONST32(0)));
 							cpu->bb = vec_bb[0];
-							BR_COND(vec_bb[2], vec_bb[3], ICMP_EQ(OR(AND(SHR(LD(reg), CONST32(DR7_TYPE_SHIFT + idx * 4)), CONST32(3)),
+							BR_COND(vec_bb[2], vec_bb[3], ICMP_EQ(OR(AND(SHR(LD(reg, getIntegerType(32)), CONST32(DR7_TYPE_SHIFT + idx * 4)), CONST32(3)),
 								AND(LD_R32(CR4_idx), CONST32(CR4_DE_MASK))), CONST32(DR7_TYPE_IO_RW | CR4_DE_MASK)));
 							cpu->bb = vec_bb[2];
 							// we don't support io watchpoints yet so for now we just abort
 							ABORT("Io watchpoints are not supported");
 							UNREACH();
 							cpu->bb = vec_bb[3];
-							ST(tlb_idx, OR(LD(tlb_idx), CONST32(TLB_WATCH))); // install watchpoint
+							ST(tlb_idx, OR(LD(tlb_idx, getIntegerType(32)), CONST32(TLB_WATCH))); // install watchpoint
 							BR_UNCOND(vec_bb[4]);
 							cpu->bb = vec_bb[1];
-							ST(tlb_idx, AND(LD(tlb_idx), CONST32(~TLB_WATCH))); // remove watchpoint
+							ST(tlb_idx, AND(LD(tlb_idx, getIntegerType(32)), CONST32(~TLB_WATCH))); // remove watchpoint
 							BR_UNCOND(vec_bb[4]);
 							cpu->bb = vec_bb[4];
-							BR_COND(vec_bb[5], vec_bb[6], ICMP_EQ(AND(SHR(LD(reg), CONST32(DR7_TYPE_SHIFT + idx * 4)), CONST32(3)), CONST32(DR7_TYPE_INSTR)));
-							cpu->bb = vec_bb[5];
-							// invalidate the tc if it is an instr breakpoint. Same as above
-							CallInst::Create(cpu->ptr_invtc_fn, std::vector<Value *> { cpu->ptr_cpu_ctx, ConstantExpr::getIntToPtr(INTPTR(cpu->tc), cpu->bb->getParent()->getReturnType()),
-								curr_watch_addr, CONST8(1), cpu->instr_eip }, "", cpu->bb);
-							BR_UNCOND(vec_bb[6]);
-							cpu->bb = vec_bb[6];
 						}
 					}
 					break;
@@ -2943,9 +3068,10 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 						LIB86CPU_ABORT();
 					}
 
-					ST_R32(LD(reg), dr_idx + dr_offset);
+					ST_REG_idx(LD(reg, getIntegerType(32)), dr_idx + dr_offset);
 					ST(GEP_EIP(), ADD(cpu->instr_eip, CONST32(bytes)));
-					if (((pc + bytes) & ~PAGE_MASK) == (pc & ~PAGE_MASK)) {
+					// instr breakpoint are checked at compile time, so we cannot jump to the next tc if we are writing to anything but dr6
+					if ((((pc + bytes) & ~PAGE_MASK) == (pc & ~PAGE_MASK)) && ((dr_idx + dr_offset) == DR6_idx)) {
 						link_dst_only_emit(cpu);
 						cpu->bb = getBB();
 						cpu->tc->flags |= TC_FLG_DST_ONLY;
@@ -2980,7 +3106,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			case 0x8C: {
 				Value *val, *rm;
 				val = LD_SEG(GET_REG_idx(instr.operands[OPNUM_SRC].reg.value));
-				GET_RM(OPNUM_DST, ST_REG_val(ZEXT32(val), IBITCAST32(rm));, ST_MEM(MEM_LD16_idx, rm, val););
+				GET_RM(OPNUM_DST, ST_REG_val(ZEXT32(val), rm);, ST_MEM(MEM_LD16_idx, rm, val););
 			}
 			break;
 
@@ -2990,37 +3116,72 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				GET_RM(OPNUM_SRC, sel = LD_REG_val(rm);, sel = LD_MEM(MEM_LD16_idx, rm););
 
 				if (cpu_ctx->hflags & HFLG_PE_MODE) {
-					std::vector<Value *> vec;
-
 					if (sel_idx == SS_idx) {
-						vec = check_ss_desc_priv_emit(cpu, sel);
-						set_access_flg_seg_desc_emit(cpu, vec[1], vec[0]);
-						write_seg_reg_emit(cpu, sel_idx, std::vector<Value *> { sel, read_seg_desc_base_emit(cpu, vec[1]),
-							read_seg_desc_limit_emit(cpu, vec[1]), read_seg_desc_flags_emit(cpu, vec[1])});
+						Function *mov_ss_helper = cast<Function>(cpu->mod->getOrInsertFunction("mov_ss_pe_helper", getIntegerType(8), cpu->ptr_cpu_ctx->getType(),
+							getIntegerType(16), getIntegerType(32)).getCallee());
+						CallInst *ci = CallInst::Create(mov_ss_helper, { cpu->ptr_cpu_ctx, sel, cpu->instr_eip }, "", cpu->bb);
+						BasicBlock *bb0 = getBB();
+						BasicBlock *bb1 = getBB();
+						BR_COND(bb0, bb1, ICMP_NE(ci, CONST8(0)));
+						cpu->bb = bb0;
+						CallInst *ci2 = CallInst::Create(cpu->ptr_exp_fn, cpu->ptr_cpu_ctx, "", cpu->bb);
+						ReturnInst::Create(CTX(), ci2, cpu->bb);
+						cpu->bb = bb1;
 						ST(GEP_EIP(), ADD(cpu->instr_eip, CONST32(bytes)));
 						if (((pc + bytes) & ~PAGE_MASK) == (pc & ~PAGE_MASK)) {
-							std::vector<BasicBlock *> vec_bb = getBBs(2);
-							BR_COND(vec_bb[0], vec_bb[1], ICMP_EQ(CONST32(cpu->cpu_ctx.hflags & HFLG_SS32), AND(LD(cpu->ptr_hflags), CONST32(HFLG_SS32))));
-							cpu->bb = vec_bb[0];
+							BasicBlock *bb2 = getBB();
+							BasicBlock *bb3 = getBB();
+							BR_COND(bb2, bb3, ICMP_EQ(CONST32(cpu->cpu_ctx.hflags & HFLG_SS32), AND(LD(cpu->ptr_hflags, getIntegerType(32)), CONST32(HFLG_SS32))));
+							cpu->bb = bb2;
 							link_dst_only_emit(cpu);
-							cpu->bb = vec_bb[1];
-							cpu->tc->flags |= TC_FLG_DST_ONLY;
+							cpu->bb = bb3;
+							cpu->tc->flags |= TC_FLG_COND_DST_ONLY;
 						}
 						translate_next = 0;
 					}
 					else {
-						std::vector<BasicBlock *> vec_bb = getBBs(3);
-						BR_COND(vec_bb[0], vec_bb[1], ICMP_EQ(SHR(sel, CONST16(2)), CONST16(0)));
-						cpu->bb = vec_bb[0];
-						write_seg_reg_emit(cpu, sel_idx, std::vector<Value *> { sel, CONST32(0), CONST32(0), CONST32(0) });
-						BR_UNCOND(vec_bb[2]);
-						cpu->bb = vec_bb[1];
-						vec = check_seg_desc_priv_emit(cpu, sel);
-						set_access_flg_seg_desc_emit(cpu, vec[1], vec[0]);
-						write_seg_reg_emit(cpu, sel_idx, std::vector<Value *> { sel /* & rpl?? */, read_seg_desc_base_emit(cpu, vec[1]),
-							read_seg_desc_limit_emit(cpu, vec[1]), read_seg_desc_flags_emit(cpu, vec[1])});
-						BR_UNCOND(vec_bb[2]);
-						cpu->bb = vec_bb[2];
+						CallInst *ci;
+						switch (sel_idx)
+						{
+						case DS_idx: {
+							Function *mov_ds_helper = cast<Function>(cpu->mod->getOrInsertFunction("mov_ds_pe_helper", getIntegerType(8), cpu->ptr_cpu_ctx->getType(),
+								getIntegerType(16), getIntegerType(32)).getCallee());
+							ci = CallInst::Create(mov_ds_helper, { cpu->ptr_cpu_ctx, sel, cpu->instr_eip }, "", cpu->bb);
+						}
+						break;
+
+						case ES_idx: {
+							Function *mov_es_helper = cast<Function>(cpu->mod->getOrInsertFunction("mov_es_pe_helper", getIntegerType(8), cpu->ptr_cpu_ctx->getType(),
+								getIntegerType(16), getIntegerType(32)).getCallee());
+							ci = CallInst::Create(mov_es_helper, { cpu->ptr_cpu_ctx, sel, cpu->instr_eip }, "", cpu->bb);
+						}
+						break;
+
+						case FS_idx: {
+							Function *mov_fs_helper = cast<Function>(cpu->mod->getOrInsertFunction("mov_fs_pe_helper", getIntegerType(8), cpu->ptr_cpu_ctx->getType(),
+								getIntegerType(16), getIntegerType(32)).getCallee());
+							ci = CallInst::Create(mov_fs_helper, { cpu->ptr_cpu_ctx, sel, cpu->instr_eip }, "", cpu->bb);
+						}
+						break;
+
+						case GS_idx: {
+							Function *mov_gs_helper = cast<Function>(cpu->mod->getOrInsertFunction("mov_gs_pe_helper", getIntegerType(8), cpu->ptr_cpu_ctx->getType(),
+								getIntegerType(16), getIntegerType(32)).getCallee());
+							ci = CallInst::Create(mov_gs_helper, { cpu->ptr_cpu_ctx, sel, cpu->instr_eip }, "", cpu->bb);
+						}
+						break;
+
+						default:
+							LIB86CPU_ABORT();
+						}
+
+						BasicBlock *bb0 = getBB();
+						BasicBlock *bb1 = getBB();
+						BR_COND(bb0, bb1, ICMP_NE(ci, CONST8(0)));
+						cpu->bb = bb0;
+						CallInst *ci2 = CallInst::Create(cpu->ptr_exp_fn, cpu->ptr_cpu_ctx, "", cpu->bb);
+						ReturnInst::Create(CTX(), ci2, cpu->bb);
+						cpu->bb = bb1;
 					}
 				}
 				else {
@@ -3044,9 +3205,10 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				size_mode = SIZE8;
 				[[fallthrough]];
 
-			case 0xA3:
+			case 0xA3: {
 				ST_MEM(fn_idx[size_mode], GET_OP(OPNUM_DST), LD_REG_val(GET_OP(OPNUM_SRC)));
-				break;
+			}
+			break;
 
 			case 0xB0:
 			case 0xB1:
@@ -3055,9 +3217,10 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			case 0xB4:
 			case 0xB5:
 			case 0xB6:
-			case 0xB7:
+			case 0xB7: {
 				ST_REG_val(GET_IMM8(), GET_OP(OPNUM_DST));
-				break;
+			}
+			break;
 
 			case 0xB8:
 			case 0xB9:
@@ -3066,9 +3229,10 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			case 0xBC:
 			case 0xBD:
 			case 0xBE:
-			case 0xBF:
+			case 0xBF: {
 				ST_REG_val(GET_IMM(), GET_OP(OPNUM_DST));
-				break;
+			}
+			break;
 
 			case 0xC6:
 				size_mode = SIZE8;
@@ -3119,7 +3283,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					UNREACH();
 					cpu->bb = vec_bb[1];
 					int mm_idx = GET_REG_idx(instr.operands[OPNUM_SRC].reg.value);
-					GET_RM(OPNUM_DST, ST_R32(LD_MM32(mm_idx), GET_REG_idx(instr.operands[OPNUM_DST].reg.value));, ST_MEM(MEM_LD32_idx, rm, LD_MM32(mm_idx)););
+					GET_RM(OPNUM_DST, ST_REG_idx(LD_MM32(mm_idx), GET_REG_idx(instr.operands[OPNUM_DST].reg.value));, ST_MEM(MEM_LD32_idx, rm, LD_MM32(mm_idx)););
 					UPDATE_FPU_AFTER_MMX_r(CONST16(0), mm_idx);
 				}
 				break;
@@ -3198,9 +3362,9 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 				cpu->bb = vec_bb[0];
 				Value *esi_sum = ADD(esi, val);
-				addr_mode == ADDR16 ? ST_R16(TRUNC16(esi_sum), ESI_idx) : ST_R32(esi_sum, ESI_idx);
+				addr_mode == ADDR16 ? ST_REG_idx(TRUNC16(esi_sum), ESI_idx) : ST_REG_idx(esi_sum, ESI_idx);
 				Value *edi_sum = ADD(edi, val);
-				addr_mode == ADDR16 ? ST_R16(TRUNC16(edi_sum), EDI_idx) : ST_R32(edi_sum, EDI_idx);
+				addr_mode == ADDR16 ? ST_REG_idx(TRUNC16(edi_sum), EDI_idx) : ST_REG_idx(edi_sum, EDI_idx);
 				if (instr.attributes & ZYDIS_ATTRIB_HAS_REP) {
 					REP();
 				}
@@ -3210,9 +3374,9 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 				cpu->bb = vec_bb[1];
 				Value *esi_sub = SUB(esi, val);
-				addr_mode == ADDR16 ? ST_R16(TRUNC16(esi_sub), ESI_idx) : ST_R32(esi_sub, ESI_idx);
+				addr_mode == ADDR16 ? ST_REG_idx(TRUNC16(esi_sub), ESI_idx) : ST_REG_idx(esi_sub, ESI_idx);
 				Value *edi_sub = SUB(edi, val);
-				addr_mode == ADDR16 ? ST_R16(TRUNC16(edi_sub), EDI_idx) : ST_R32(edi_sub, EDI_idx);
+				addr_mode == ADDR16 ? ST_REG_idx(TRUNC16(edi_sub), EDI_idx) : ST_REG_idx(edi_sub, EDI_idx);
 				if (instr.attributes & ZYDIS_ATTRIB_HAS_REP) {
 					REP();
 				}
@@ -3244,7 +3408,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			case 0xBF: {
 				Value *rm, *val;
 				GET_RM(OPNUM_SRC, val = LD_R16(GET_REG_idx(instr.operands[OPNUM_SRC].reg.value));, val = LD_MEM(MEM_LD16_idx, rm););
-				ST_REG_val(SEXT32(val), GEP_R32(GET_REG_idx(instr.operands[OPNUM_DST].reg.value)));
+				ST_REG_val(SEXT32(val), GEP_REG_idx(GET_REG_idx(instr.operands[OPNUM_DST].reg.value)));
 			}
 			break;
 
@@ -3268,7 +3432,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			case 0xB7: {
 				Value *rm, *val;
 				GET_RM(OPNUM_SRC, val = LD_R16(GET_REG_idx(instr.operands[OPNUM_SRC].reg.value));, val = LD_MEM(MEM_LD16_idx, rm););
-				ST_REG_val(ZEXT32(val), GEP_R32(GET_REG_idx(instr.operands[OPNUM_DST].reg.value)));
+				ST_REG_val(ZEXT32(val), GEP_REG_idx(GET_REG_idx(instr.operands[OPNUM_DST].reg.value)));
 			}
 			break;
 
@@ -3295,7 +3459,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					reg = LD_R8L(EAX_idx);
 					GET_RM(OPNUM_SINGLE, val = LD_REG_val(rm);, val = LD_MEM(fn_idx[size_mode], rm););
 					out = MUL(ZEXT16(reg), ZEXT16(val));
-					ST_REG_val(out, GEP_R16(EAX_idx));
+					ST_REG_val(out, GEP_REG_idx(EAX_idx));
 					ST_FLG_AUX(SHL(ZEXT32(NOT_ZERO(16, SHR(out, CONST16(8)))), CONST32(31)));
 					break;
 
@@ -3303,8 +3467,8 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					reg = LD_R16(EAX_idx);
 					GET_RM(OPNUM_SINGLE, val = LD_REG_val(rm);, val = LD_MEM(fn_idx[size_mode], rm););
 					out = MUL(ZEXT32(reg), ZEXT32(val));
-					ST_REG_val(TRUNC16(SHR(out, CONST32(16))), GEP_R16(EDX_idx));
-					ST_REG_val(TRUNC16(out), GEP_R16(EAX_idx));
+					ST_REG_val(TRUNC16(SHR(out, CONST32(16))), GEP_REG_idx(EDX_idx));
+					ST_REG_val(TRUNC16(out), GEP_REG_idx(EAX_idx));
 					ST_FLG_AUX(SHL(NOT_ZERO(32, SHR(out, CONST32(16))), CONST32(31)));
 					break;
 
@@ -3312,8 +3476,8 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					reg = LD_R32(EAX_idx);
 					GET_RM(OPNUM_SINGLE, val = LD_REG_val(rm);, val = LD_MEM(fn_idx[size_mode], rm););
 					out = MUL(ZEXT64(reg), ZEXT64(val));
-					ST_REG_val(TRUNC32(SHR(out, CONST64(32))), GEP_R32(EDX_idx));
-					ST_REG_val(TRUNC32(out), GEP_R32(EAX_idx));
+					ST_REG_val(TRUNC32(SHR(out, CONST64(32))), GEP_REG_idx(EDX_idx));
+					ST_REG_val(TRUNC32(out), GEP_REG_idx(EAX_idx));
 					ST_FLG_AUX(SHL(TRUNC32(NOT_ZERO(64, SHR(out, CONST64(32)))), CONST32(31)));
 					break;
 
@@ -3461,7 +3625,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			case 0xE7: {
 				Value *port = CONST8(instr.operands[OPNUM_DST].imm.value.u);
 				check_io_priv_emit(cpu, ZEXT32(port), size_mode);
-				ST_IO(fn_io_idx[size_mode], ZEXT16(port), size_mode == SIZE16 ? LD_R16(EAX_idx) : size_mode == SIZE32 ? LD_R32(EAX_idx) : LD_R8L(EAX_idx));
+				ST_IO(ZEXT16(port), size_mode == SIZE16 ? LD_R16(EAX_idx) : size_mode == SIZE32 ? LD_R32(EAX_idx) : LD_R8L(EAX_idx));
 			}
 			break;
 
@@ -3472,7 +3636,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			case 0xEF: {
 				Value *port = LD_R16(EDX_idx);
 				check_io_priv_emit(cpu, ZEXT32(port), size_mode);
-				ST_IO(fn_io_idx[size_mode], port, size_mode == SIZE16 ? LD_R16(EAX_idx) : size_mode == SIZE32 ? LD_R32(EAX_idx) : LD_R8L(EAX_idx));
+				ST_IO(port, size_mode == SIZE16 ? LD_R16(EAX_idx) : size_mode == SIZE32 ? LD_R32(EAX_idx) : LD_R8L(EAX_idx));
 			}
 			break;
 
@@ -3519,19 +3683,19 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				case SIZE8:
 					val = CONST32(1);
 					io_val = LD_MEM(MEM_LD8_idx, addr);
-					ST_IO(IO_ST8_idx, port, io_val);
+					ST_IO(port, io_val);
 					break;
 
 				case SIZE16:
 					val = CONST32(2);
 					io_val = LD_MEM(MEM_LD16_idx, addr);
-					ST_IO(IO_ST16_idx, port, io_val);
+					ST_IO(port, io_val);
 					break;
 
 				case SIZE32:
 					val = CONST32(4);
 					io_val = LD_MEM(MEM_LD32_idx, addr);
-					ST_IO(IO_ST32_idx, port, io_val);
+					ST_IO(port, io_val);
 					break;
 
 				default:
@@ -3543,7 +3707,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 				cpu->bb = vec_bb[0];
 				Value *esi_sum = ADD(esi, val);
-				addr_mode == ADDR16 ? ST_R16(TRUNC16(esi_sum), ESI_idx) : ST_R32(esi_sum, ESI_idx);
+				addr_mode == ADDR16 ? ST_REG_idx(TRUNC16(esi_sum), ESI_idx) : ST_REG_idx(esi_sum, ESI_idx);
 				if (instr.attributes & ZYDIS_ATTRIB_HAS_REP) {
 					REP();
 				}
@@ -3553,7 +3717,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 				cpu->bb = vec_bb[1];
 				Value *esi_sub = SUB(esi, val);
-				addr_mode == ADDR16 ? ST_R16(TRUNC16(esi_sub), ESI_idx) : ST_R32(esi_sub, ESI_idx);
+				addr_mode == ADDR16 ? ST_REG_idx(TRUNC16(esi_sub), ESI_idx) : ST_REG_idx(esi_sub, ESI_idx);
 				if (instr.attributes & ZYDIS_ATTRIB_HAS_REP) {
 					REP();
 				}
@@ -3587,8 +3751,8 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 					vec = MEM_POP(1);
 					ST_REG_val(vec[1], vec[2]);
-					size_mode == SIZE16 ? ST_R16(vec[0], GET_REG_idx(instr.operands[OPNUM_SINGLE].reg.value)) :
-						ST_R32(vec[0], GET_REG_idx(instr.operands[OPNUM_SINGLE].reg.value));
+					size_mode == SIZE16 ? ST_REG_idx(vec[0], GET_REG_idx(instr.operands[OPNUM_SINGLE].reg.value)) :
+						ST_REG_idx(vec[0], GET_REG_idx(instr.operands[OPNUM_SINGLE].reg.value));
 				}
 				break;
 
@@ -3625,38 +3789,73 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					}
 
 					if (cpu_ctx->hflags & HFLG_PE_MODE) {
-						std::vector<Value *> vec;
-
 						if (sel_idx == SS_idx) {
-							vec = check_ss_desc_priv_emit(cpu, sel);
-							set_access_flg_seg_desc_emit(cpu, vec[1], vec[0]);
-							write_seg_reg_emit(cpu, sel_idx, std::vector<Value *> { sel, read_seg_desc_base_emit(cpu, vec[1]),
-								read_seg_desc_limit_emit(cpu, vec[1]), read_seg_desc_flags_emit(cpu, vec[1])});
+							Function *mov_ss_helper = cast<Function>(cpu->mod->getOrInsertFunction("mov_ss_pe_helper", getIntegerType(8), cpu->ptr_cpu_ctx->getType(),
+								getIntegerType(16), getIntegerType(32)).getCallee());
+							CallInst *ci = CallInst::Create(mov_ss_helper, { cpu->ptr_cpu_ctx, sel, cpu->instr_eip }, "", cpu->bb);
+							BasicBlock *bb0 = getBB();
+							BasicBlock *bb1 = getBB();
+							BR_COND(bb0, bb1, ICMP_NE(ci, CONST8(0)));
+							cpu->bb = bb0;
+							CallInst *ci2 = CallInst::Create(cpu->ptr_exp_fn, cpu->ptr_cpu_ctx, "", cpu->bb);
+							ReturnInst::Create(CTX(), ci2, cpu->bb);
+							cpu->bb = bb1;
 							ST(GEP_EIP(), ADD(cpu->instr_eip, CONST32(bytes)));
 							ST_REG_val(vec_pop[1], vec_pop[2]);
 							if (((pc + bytes) & ~PAGE_MASK) == (pc & ~PAGE_MASK)) {
-								std::vector<BasicBlock *> vec_bb = getBBs(2);
-								BR_COND(vec_bb[0], vec_bb[1], ICMP_EQ(CONST32(cpu->cpu_ctx.hflags & HFLG_SS32), AND(LD(cpu->ptr_hflags), CONST32(HFLG_SS32))));
-								cpu->bb = vec_bb[0];
+								BasicBlock *bb2 = getBB();
+								BasicBlock *bb3 = getBB();
+								BR_COND(bb2, bb3, ICMP_EQ(CONST32(cpu->cpu_ctx.hflags & HFLG_SS32), AND(LD(cpu->ptr_hflags, getIntegerType(32)), CONST32(HFLG_SS32))));
+								cpu->bb = bb2;
 								link_dst_only_emit(cpu);
-								cpu->bb = vec_bb[1];
-								cpu->tc->flags |= TC_FLG_DST_ONLY;
+								cpu->bb = bb3;
+								cpu->tc->flags |= TC_FLG_COND_DST_ONLY;
 							}
 							translate_next = 0;
 						}
 						else {
-							std::vector<BasicBlock *> vec_bb = getBBs(3);
-							BR_COND(vec_bb[0], vec_bb[1], ICMP_EQ(SHR(sel, CONST16(2)), CONST16(0)));
-							cpu->bb = vec_bb[0];
-							write_seg_reg_emit(cpu, sel_idx, std::vector<Value *> { sel, CONST32(0), CONST32(0), CONST32(0) });
-							BR_UNCOND(vec_bb[2]);
-							cpu->bb = vec_bb[1];
-							vec = check_seg_desc_priv_emit(cpu, sel);
-							set_access_flg_seg_desc_emit(cpu, vec[1], vec[0]);
-							write_seg_reg_emit(cpu, sel_idx, std::vector<Value *> { sel, read_seg_desc_base_emit(cpu, vec[1]),
-								read_seg_desc_limit_emit(cpu, vec[1]), read_seg_desc_flags_emit(cpu, vec[1])});
-							BR_UNCOND(vec_bb[2]);
-							cpu->bb = vec_bb[2];
+							CallInst *ci;
+							switch (sel_idx)
+							{
+							case DS_idx: {
+								Function *mov_ds_helper = cast<Function>(cpu->mod->getOrInsertFunction("mov_ds_pe_helper", getIntegerType(8), cpu->ptr_cpu_ctx->getType(),
+									getIntegerType(16), getIntegerType(32)).getCallee());
+								ci = CallInst::Create(mov_ds_helper, { cpu->ptr_cpu_ctx, sel, cpu->instr_eip }, "", cpu->bb);
+							}
+							break;
+
+							case ES_idx: {
+								Function *mov_es_helper = cast<Function>(cpu->mod->getOrInsertFunction("mov_es_pe_helper", getIntegerType(8), cpu->ptr_cpu_ctx->getType(),
+									getIntegerType(16), getIntegerType(32)).getCallee());
+								ci = CallInst::Create(mov_es_helper, { cpu->ptr_cpu_ctx, sel, cpu->instr_eip }, "", cpu->bb);
+							}
+							break;
+
+							case FS_idx: {
+								Function *mov_fs_helper = cast<Function>(cpu->mod->getOrInsertFunction("mov_fs_pe_helper", getIntegerType(8), cpu->ptr_cpu_ctx->getType(),
+									getIntegerType(16), getIntegerType(32)).getCallee());
+								ci = CallInst::Create(mov_fs_helper, { cpu->ptr_cpu_ctx, sel, cpu->instr_eip }, "", cpu->bb);
+							}
+							break;
+
+							case GS_idx: {
+								Function *mov_gs_helper = cast<Function>(cpu->mod->getOrInsertFunction("mov_gs_pe_helper", getIntegerType(8), cpu->ptr_cpu_ctx->getType(),
+									getIntegerType(16), getIntegerType(32)).getCallee());
+								ci = CallInst::Create(mov_gs_helper, { cpu->ptr_cpu_ctx, sel, cpu->instr_eip }, "", cpu->bb);
+							}
+							break;
+
+							default:
+								LIB86CPU_ABORT();
+							}
+
+							BasicBlock *bb0 = getBB();
+							BasicBlock *bb1 = getBB();
+							BR_COND(bb0, bb1, ICMP_NE(ci, CONST8(0)));
+							cpu->bb = bb0;
+							CallInst *ci2 = CallInst::Create(cpu->ptr_exp_fn, cpu->ptr_cpu_ctx, "", cpu->bb);
+							ReturnInst::Create(CTX(), ci2, cpu->bb);
+							cpu->bb = bb1;
 							ST_REG_val(vec_pop[1], vec_pop[2]);
 						}
 					}
@@ -3683,11 +3882,11 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				for (int8_t reg_idx = EDI_idx; reg_idx >= EAX_idx; reg_idx--) {
 					if (reg_idx != ESP_idx) {
 						Value *reg = LD_MEM(MEM_LD32_idx, ADD(ZEXT32(sp), LD_SEG_HIDDEN(SS_idx, SEG_BASE_idx)));
-						ST_R32(reg, reg_idx);
+						ST_REG_idx(reg, reg_idx);
 					}
 					sp = ADD(sp, CONST16(4));
 				}
-				ST_R16(sp, ESP_idx);
+				ST_REG_idx(sp, ESP_idx);
 			}
 			break;
 
@@ -3696,11 +3895,11 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				for (int8_t reg_idx = EDI_idx; reg_idx >= EAX_idx; reg_idx--) {
 					if (reg_idx != ESP_idx) {
 						Value *reg = LD_MEM(MEM_LD32_idx, ADD(esp, LD_SEG_HIDDEN(SS_idx, SEG_BASE_idx)));
-						ST_R32(reg, reg_idx);
+						ST_REG_idx(reg, reg_idx);
 					}
 					esp = ADD(esp, CONST32(4));
 				}
-				ST_R32(esp, ESP_idx);
+				ST_REG_idx(esp, ESP_idx);
 			}
 			break;
 
@@ -3709,11 +3908,11 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				for (int8_t reg_idx = EDI_idx; reg_idx >= EAX_idx; reg_idx--) {
 					if (reg_idx != ESP_idx) {
 						Value *reg = LD_MEM(MEM_LD16_idx, ADD(ZEXT32(sp), LD_SEG_HIDDEN(SS_idx, SEG_BASE_idx)));
-						ST_R16(reg, reg_idx);
+						ST_REG_idx(reg, reg_idx);
 					}
 					sp = ADD(sp, CONST16(2));
 				}
-				ST_R16(sp, ESP_idx);
+				ST_REG_idx(sp, ESP_idx);
 			}
 			break;
 
@@ -3722,11 +3921,11 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				for (int8_t reg_idx = EDI_idx; reg_idx >= EAX_idx; reg_idx--) {
 					if (reg_idx != ESP_idx) {
 						Value *reg = LD_MEM(MEM_LD16_idx, ADD(esp, LD_SEG_HIDDEN(SS_idx, SEG_BASE_idx)));
-						ST_R16(reg, reg_idx);
+						ST_REG_idx(reg, reg_idx);
 					}
 					esp = ADD(esp, CONST32(2));
 				}
-				ST_R32(esp, ESP_idx);
+				ST_REG_idx(esp, ESP_idx);
 			}
 			break;
 
@@ -3769,7 +3968,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				cpu->bb = vec_bb[0];
 				link_dst_only_emit(cpu);
 				cpu->bb = vec_bb[1];
-				cpu->tc->flags |= TC_FLG_DST_ONLY;
+				cpu->tc->flags |= TC_FLG_COND_DST_ONLY;
 			}
 			translate_next = 0;
 		}
@@ -4028,7 +4227,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			switch (size_mode)
 			{
 			case SIZE8: {
-				GET_RM(OPNUM_DST, val = LD_REG_val(rm); , val = LD_MEM(fn_idx[size_mode], rm););
+				GET_RM(OPNUM_DST, val = LD_REG_val(rm);, val = LD_MEM(fn_idx[size_mode], rm););
 				Value *i9 = OR(SHL(ZEXTs(9, val), CONSTs(9, 1)), TRUNCs(9, SHR(LD_CF(), CONST32(31))));
 				Value *rotr = INTRINSIC_ty(fshr, getIntegerType(9), (std::vector<Value *> { val, val, TRUNCs(9, count) }));
 				Value *cf = ZEXT32(AND(SHR(val, SUB(TRUNC8(count), CONST8(1))), CONST8(1)));
@@ -4039,7 +4238,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			break;
 
 			case SIZE16: {
-				GET_RM(OPNUM_DST, val = LD_REG_val(rm); , val = LD_MEM(fn_idx[size_mode], rm););
+				GET_RM(OPNUM_DST, val = LD_REG_val(rm);, val = LD_MEM(fn_idx[size_mode], rm););
 				Value *i17 = OR(SHL(ZEXTs(17, val), CONSTs(17, 1)), TRUNCs(17, SHR(LD_CF(), CONST32(31))));
 				Value *rotr = INTRINSIC_ty(fshr, getIntegerType(17), (std::vector<Value *> { val, val, TRUNCs(17, count) }));
 				Value *cf = ZEXT32(AND(SHR(val, SUB(TRUNC16(count), CONST16(1))), CONST16(1)));
@@ -4050,7 +4249,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			break;
 
 			case SIZE32: {
-				GET_RM(OPNUM_DST, val = LD_REG_val(rm); , val = LD_MEM(fn_idx[size_mode], rm););
+				GET_RM(OPNUM_DST, val = LD_REG_val(rm);, val = LD_MEM(fn_idx[size_mode], rm););
 				Value *i33 = OR(SHL(ZEXTs(33, val), CONSTs(33, 1)), SHL(ZEXTs(33, LD_CF()), CONSTs(33, 31)));
 				Value *rotr = INTRINSIC_ty(fshr, getIntegerType(33), (std::vector<Value *> { val, val, ZEXTs(33, count) }));
 				Value *cf = AND(SHR(val, SUB(count, CONST32(1))), CONST32(1));
@@ -4082,7 +4281,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				translate_next = 0;
 			}
 			else {
-				Function *msr_r_fn = cast<Function>(cpu->mod->getOrInsertFunction("cpu_msr_read", getVoidType(), cpu->ptr_cpu_ctx->getType()));
+				Function *msr_r_fn = cast<Function>(cpu->mod->getOrInsertFunction("msr_read_helper", getVoidType(), cpu->ptr_cpu_ctx->getType()).getCallee());
 				CallInst::Create(msr_r_fn, cpu->ptr_cpu_ctx, "", cpu->bb);
 			}
 		}
@@ -4099,7 +4298,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				cpu->bb = vec_bb[1];
 			}
 
-			Function *rdtsc_fn = cast<Function>(cpu->mod->getOrInsertFunction("cpu_rdtsc_handler", getVoidType(), cpu->ptr_cpu_ctx->getType()));
+			Function *rdtsc_fn = cast<Function>(cpu->mod->getOrInsertFunction("cpu_rdtsc_handler", getVoidType(), cpu->ptr_cpu_ctx->getType()).getCallee());
 			CallInst::Create(rdtsc_fn, cpu->ptr_cpu_ctx, "", cpu->bb);
 		}
 		break;
@@ -4120,15 +4319,15 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 					ret_eip = ZEXT32(ret_eip);
 				}
 				ST_REG_val(vec[1], vec[2]);
-				ST_R32(ret_eip, EIP_idx);
+				ST_REG_idx(ret_eip, EIP_idx);
 				if (has_imm_op) {
 					if (cpu->cpu_ctx.hflags & HFLG_SS32) {
-						Value *esp_ptr = GEP_R32(ESP_idx);
-						ST_REG_val(ADD(LD_REG_val(esp_ptr), CONST32(instr.operands[OPNUM_SINGLE].imm.value.u)), esp_ptr);
+						Value *esp_ptr = GEP_REG_idx(ESP_idx);
+						ST_REG_val(ADD(LD(esp_ptr, getIntegerType(32)), CONST32(instr.operands[OPNUM_SINGLE].imm.value.u)), esp_ptr);
 					}
 					else {
-						Value *esp_ptr = GEP_R16(ESP_idx);
-						ST_REG_val(ADD(LD_REG_val(esp_ptr), CONST16(instr.operands[OPNUM_SINGLE].imm.value.u)), esp_ptr);
+						Value *esp_ptr = GEP_REG_idx(ESP_idx);
+						ST_REG_val(ADD(LD(esp_ptr, getIntegerType(16)), CONST16(instr.operands[OPNUM_SINGLE].imm.value.u)), esp_ptr);
 					}
 				}
 			}
@@ -4136,7 +4335,16 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 			case 0xCB: {
 				if (cpu_ctx->hflags & HFLG_PE_MODE) {
-					ret_pe_emit(cpu, size_mode, false);
+					Function *lret_helper = cast<Function>(cpu->mod->getOrInsertFunction("lret_pe_helper", getIntegerType(8), cpu->ptr_cpu_ctx->getType(),
+						getIntegerType(8), getIntegerType(32)).getCallee());
+					CallInst *ci = CallInst::Create(lret_helper, { cpu->ptr_cpu_ctx, CONST8(size_mode), cpu->instr_eip }, "", cpu->bb);
+					BasicBlock *bb0 = getBB();
+					BasicBlock *bb1 = getBB();
+					BR_COND(bb0, bb1, ICMP_NE(ci, CONST8(0)));
+					cpu->bb = bb0;
+					CallInst *ci2 = CallInst::Create(cpu->ptr_exp_fn, cpu->ptr_cpu_ctx, "", cpu->bb);
+					ReturnInst::Create(CTX(), ci2, cpu->bb);
+					cpu->bb = bb1;
 				}
 				else {
 					std::vector<Value *> vec = MEM_POP(2);
@@ -4149,7 +4357,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 						cs = TRUNC16(cs);
 					}
 					ST_REG_val(vec[2], vec[3]);
-					ST_R32(eip, EIP_idx);
+					ST_REG_idx(eip, EIP_idx);
 					ST_SEG(cs, CS_idx);
 					ST_SEG_HIDDEN(SHL(ZEXT32(cs), CONST32(4)), CS_idx, SEG_BASE_idx);
 				}
@@ -4160,7 +4368,8 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				BAD;
 			}
 
-			cpu->tc->flags |= TC_FLG_INDIRECT;
+			link_ret_emit(cpu);
+			cpu->tc->flags |= TC_FLG_RET;
 			translate_next = 0;
 		}
 		break;
@@ -4436,20 +4645,20 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				{
 				case SIZE8:
 					src = CONST8(instr.operands[OPNUM_SRC].imm.value.u);
-					rm = GEP_R8L(EAX_idx);
-					dst = LD(rm);
+					rm = GEP_REG_idx(EAX_idx);
+					dst = LD(rm, getIntegerType(8));
 					break;
 
 				case SIZE16:
 					src = CONST16(instr.operands[OPNUM_SRC].imm.value.u);
-					rm = GEP_R16(EAX_idx);
-					dst = LD(rm);
+					rm = GEP_REG_idx(EAX_idx);
+					dst = LD(rm, getIntegerType(16));
 					break;
 
 				case SIZE32:
 					src = CONST32(instr.operands[OPNUM_SRC].imm.value.u);
-					rm = GEP_R32(EAX_idx);
-					dst = LD(rm);
+					rm = GEP_REG_idx(EAX_idx);
+					dst = LD(rm, getIntegerType(32));
 					break;
 
 				default:
@@ -4608,7 +4817,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 				cpu->bb = vec_bb[0];
 				Value *edi_sum = ADD(edi, val);
-				addr_mode == ADDR16 ? ST_R16(TRUNC16(edi_sum), EDI_idx) : ST_R32(edi_sum, EDI_idx);
+				addr_mode == ADDR16 ? ST_REG_idx(TRUNC16(edi_sum), EDI_idx) : ST_REG_idx(edi_sum, EDI_idx);
 				if (instr.attributes & ZYDIS_ATTRIB_HAS_REPNZ) {
 					REPNZ();
 				}
@@ -4621,7 +4830,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 				cpu->bb = vec_bb[1];
 				Value *edi_sub = SUB(edi, val);
-				addr_mode == ADDR16 ? ST_R16(TRUNC16(edi_sub), EDI_idx) : ST_R32(edi_sub, EDI_idx);
+				addr_mode == ADDR16 ? ST_REG_idx(TRUNC16(edi_sub), EDI_idx) : ST_REG_idx(edi_sub, EDI_idx);
 				if (instr.attributes & ZYDIS_ATTRIB_HAS_REPNZ) {
 					REPNZ();
 				}
@@ -4739,7 +4948,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			ST(byte, CONST8(0));
 			BR_UNCOND(vec_bb[2]);
 			cpu->bb = vec_bb[2];
-			GET_RM(OPNUM_SINGLE, ST_REG_val(LD(byte), rm);, ST_MEM(MEM_LD8_idx, rm, LD(byte)););
+			GET_RM(OPNUM_SINGLE, ST_REG_val(LD(byte, getIntegerType(8)), rm);, ST_MEM(MEM_LD8_idx, rm, LD(byte, getIntegerType(8))););
 		}
 		break;
 
@@ -4784,48 +4993,132 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			std::vector<BasicBlock *> vec_bb = getBBs(2);
 			BR_COND(vec_bb[0], vec_bb[1], ICMP_EQ(count, CONST32(0)));
 			cpu->bb = vec_bb[1];
-			Value *val, *rm, *temp, *cf, *of, *of_mask, *cf_mask;
+			Value *val, *rm, *cf, *of, *of_mask, *cf_mask;
 			switch (size_mode)
 			{
 			case SIZE8: {
 				std::vector<BasicBlock *> vec_bb2 = getBBs(2);
+				rm = GET_OP(OPNUM_DST);
 				BR_COND(vec_bb2[0], vec_bb2[1], ICMP_ULE(count, CONST32(8)));
 				cpu->bb = vec_bb2[0];
 				cf_mask = SHL(CONST32(1), SUB(CONST32(8), count));
 				of_mask = CONST32(1 << 7);
-				GET_RM(OPNUM_DST, val = ZEXT32(LD_REG_val(rm)); cf = SHL(AND(val, cf_mask), ADD(count, CONST32(23))); val = SHL(val, count);
-				of = SHL(AND(val, of_mask), CONST32(23)); val = TRUNC8(val); ST_REG_val(val, rm); SET_FLG(val, OR(cf, of)); BR_UNCOND(vec_bb[0]);
-				cpu->bb = vec_bb2[1]; ST_REG_val(CONST8(0), rm); SET_FLG(CONST8(0), CONST32(0)); BR_UNCOND(vec_bb[0]);,
-				temp = LD_MEM(fn_idx[size_mode], rm); val = ZEXT32(temp); cf = SHL(AND(val, cf_mask), ADD(count, CONST32(23)));
-				val = SHL(val, count); of = SHL(AND(val, of_mask), CONST32(23)); val = TRUNC8(val); ST_MEM(fn_idx[size_mode], rm, val); SET_FLG(val, OR(cf, of));
-				BR_UNCOND(vec_bb[0]); cpu->bb = vec_bb2[1]; ST_MEM(fn_idx[size_mode], rm, CONST8(0)); SET_FLG(CONST8(0), CONST32(0)); BR_UNCOND(vec_bb[0]););
+				switch (instr.operands[OPNUM_DST].type)
+				{
+				case ZYDIS_OPERAND_TYPE_REGISTER:
+					val = ZEXT32(LD_REG_val(rm));
+					cf = SHL(AND(val, cf_mask), ADD(count, CONST32(23)));
+					val = SHL(val, count);
+					of = SHL(AND(val, of_mask), CONST32(23));
+					val = TRUNC8(val);
+					ST_REG_val(val, rm);
+					SET_FLG(val, OR(cf, of));
+					BR_UNCOND(vec_bb[0]);
+					cpu->bb = vec_bb2[1];
+					ST_REG_val(CONST8(0), rm);
+					SET_FLG(CONST8(0), CONST32(0));
+					BR_UNCOND(vec_bb[0]);
+					break;
+
+				case ZYDIS_OPERAND_TYPE_MEMORY: {
+					Value *temp = LD_MEM(fn_idx[size_mode], rm);
+					val = ZEXT32(temp);
+					cf = SHL(AND(val, cf_mask), ADD(count, CONST32(23)));
+					val = SHL(val, count);
+					of = SHL(AND(val, of_mask), CONST32(23));
+					val = TRUNC8(val);
+					ST_MEM(fn_idx[size_mode], rm, val);
+					SET_FLG(val, OR(cf, of));
+					BR_UNCOND(vec_bb[0]);
+					cpu->bb = vec_bb2[1];
+					ST_MEM(fn_idx[size_mode], rm, CONST8(0));
+					SET_FLG(CONST8(0), CONST32(0));
+					BR_UNCOND(vec_bb[0]);
+				}
+				break;
+
+				default:
+					LIB86CPU_ABORT_msg("Invalid operand type used in GET_RM macro!");
+				}
 			}
 			break;
 
 			case SIZE16: {
 				std::vector<BasicBlock *> vec_bb2 = getBBs(2);
+				rm = GET_OP(OPNUM_DST);
 				BR_COND(vec_bb2[0], vec_bb2[1], ICMP_ULE(count, CONST32(16)));
 				cpu->bb = vec_bb2[0];
 				cf_mask = SHL(CONST32(1), SUB(CONST32(16), count));
 				of_mask = CONST32(1 << 15);
-				GET_RM(OPNUM_DST, val = ZEXT32(LD_REG_val(rm)); cf = SHL(AND(val, cf_mask), ADD(count, CONST32(15))); val = SHL(val, count);
-				of = SHL(AND(val, of_mask), CONST32(15)); val = TRUNC16(val); ST_REG_val(val, rm); SET_FLG(val, OR(cf, of)); BR_UNCOND(vec_bb[0]);
-				cpu->bb = vec_bb2[1]; ST_REG_val(CONST16(0), rm); SET_FLG(CONST16(0), CONST32(0)); BR_UNCOND(vec_bb[0]);,
-				temp = LD_MEM(fn_idx[size_mode], rm); val = ZEXT32(temp); cf = SHL(AND(val, cf_mask), ADD(count, CONST32(15)));
-				val = SHL(val, count); of = SHL(AND(val, of_mask), CONST32(15)); val = TRUNC16(val); ST_MEM(fn_idx[size_mode], rm, val); SET_FLG(val, OR(cf, of));
-				BR_UNCOND(vec_bb[0]); cpu->bb = vec_bb2[1]; ST_MEM(fn_idx[size_mode], rm, CONST16(0)); SET_FLG(CONST16(0), CONST32(0)); BR_UNCOND(vec_bb[0]););
+				switch (instr.operands[OPNUM_DST].type)
+				{
+				case ZYDIS_OPERAND_TYPE_REGISTER:
+					val = ZEXT32(LD_REG_val(rm));
+					cf = SHL(AND(val, cf_mask), ADD(count, CONST32(15)));
+					val = SHL(val, count);
+					of = SHL(AND(val, of_mask), CONST32(15));
+					val = TRUNC16(val);
+					ST_REG_val(val, rm);
+					SET_FLG(val, OR(cf, of));
+					BR_UNCOND(vec_bb[0]);
+					cpu->bb = vec_bb2[1];
+					ST_REG_val(CONST16(0), rm);
+					SET_FLG(CONST16(0), CONST32(0));
+					BR_UNCOND(vec_bb[0]);
+					break;
+
+				case ZYDIS_OPERAND_TYPE_MEMORY: {
+					Value *temp = LD_MEM(fn_idx[size_mode], rm);
+					val = ZEXT32(temp);
+					cf = SHL(AND(val, cf_mask), ADD(count, CONST32(15)));
+					val = SHL(val, count);
+					of = SHL(AND(val, of_mask), CONST32(15));
+					val = TRUNC16(val); ST_MEM(fn_idx[size_mode], rm, val);
+					SET_FLG(val, OR(cf, of));
+					BR_UNCOND(vec_bb[0]);
+					cpu->bb = vec_bb2[1];
+					ST_MEM(fn_idx[size_mode], rm, CONST16(0));
+					SET_FLG(CONST16(0), CONST32(0));
+					BR_UNCOND(vec_bb[0]);
+				}
+				break;
+
+				default:
+					LIB86CPU_ABORT_msg("Invalid operand type used in GET_RM macro!");
+				}
 			}
 			break;
 
-			case SIZE32:
+			case SIZE32: {
 				cf_mask = SHL(CONST32(1), SUB(CONST32(32), count));
 				of_mask = CONST32(1 << 31);
-				GET_RM(OPNUM_DST, val = LD_REG_val(rm); cf = SHL(AND(val, cf_mask), SUB(count, CONST32(1))); val = SHL(val, count); of = SHR(AND(val, of_mask), CONST32(1));
-				ST_REG_val(val, rm);, val = LD_MEM(fn_idx[size_mode], rm); cf = SHL(AND(val, cf_mask), SUB(count, CONST32(1))); val = SHL(val, count);
-				of = SHR(AND(val, of_mask), CONST32(1)); ST_MEM(fn_idx[size_mode], rm, val););
+				rm = GET_OP(OPNUM_DST);
+				switch (instr.operands[OPNUM_DST].type)
+				{
+				case ZYDIS_OPERAND_TYPE_REGISTER:
+					val = LD_REG_val(rm);
+					cf = SHL(AND(val, cf_mask), SUB(count, CONST32(1)));
+					val = SHL(val, count);
+					of = SHR(AND(val, of_mask), CONST32(1));
+					ST_REG_val(val, rm);
+					break;
+
+				case ZYDIS_OPERAND_TYPE_MEMORY: {
+					val = LD_MEM(fn_idx[size_mode], rm);
+					cf = SHL(AND(val, cf_mask), SUB(count, CONST32(1)));
+					val = SHL(val, count);
+					of = SHR(AND(val, of_mask), CONST32(1));
+					ST_MEM(fn_idx[size_mode], rm, val);
+				}
+				break;
+
+				default:
+					LIB86CPU_ABORT_msg("Invalid operand type used in GET_RM macro!");
+				}
 				SET_FLG(val, OR(cf, of));
 				BR_UNCOND(vec_bb[0]);
-				break;
+			}
+			break;
 
 			default:
 				LIB86CPU_ABORT();
@@ -5049,7 +5342,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 			Value *eflags = LD_R32(EFLAGS_idx);
 			eflags = OR(eflags, CONST32(DF_MASK));
-			ST_R32(eflags, EFLAGS_idx);
+			ST_REG_idx(eflags, EFLAGS_idx);
 		}
 		break;
 
@@ -5062,7 +5355,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 				// we don't support virtual 8086 mode, so we don't need to check for it
 				if (((cpu->cpu_ctx.regs.eflags & IOPL_MASK) >> 12) >= (cpu->cpu_ctx.hflags & HFLG_CPL)) {
 					eflags = OR(eflags, CONST32(IF_MASK));
-					ST_R32(eflags, EFLAGS_idx);
+					ST_REG_idx(eflags, EFLAGS_idx);
 				}
 				else {
 					RAISEin0(EXP_GP);
@@ -5071,7 +5364,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			}
 			else {
 				eflags = OR(eflags, CONST32(IF_MASK));
-				ST_R32(eflags, EFLAGS_idx);
+				ST_REG_idx(eflags, EFLAGS_idx);
 			}
 		}
 		break;
@@ -5135,7 +5428,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 				cpu->bb = vec_bb[0];
 				Value *edi_sum = ADD(edi, val);
-				addr_mode == ADDR16 ? ST_R16(TRUNC16(edi_sum), EDI_idx) : ST_R32(edi_sum, EDI_idx);
+				addr_mode == ADDR16 ? ST_REG_idx(TRUNC16(edi_sum), EDI_idx) : ST_REG_idx(edi_sum, EDI_idx);
 				if (instr.attributes & ZYDIS_ATTRIB_HAS_REP) {
 					REP();
 				}
@@ -5145,7 +5438,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 				cpu->bb = vec_bb[1];
 				Value *edi_sub = SUB(edi, val);
-				addr_mode == ADDR16 ? ST_R16(TRUNC16(edi_sub), EDI_idx) : ST_R32(edi_sub, EDI_idx);
+				addr_mode == ADDR16 ? ST_REG_idx(TRUNC16(edi_sub), EDI_idx) : ST_REG_idx(edi_sub, EDI_idx);
 				if (instr.attributes & ZYDIS_ATTRIB_HAS_REP) {
 					REP();
 				}
@@ -5288,32 +5581,16 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 			Value *rm, *sel;
 			GET_RM(OPNUM_SINGLE, sel = LD_REG_val(rm);, sel = LD_MEM(MEM_LD16_idx, rm););
-			std::vector<BasicBlock *> vec_bb = getBBs(5);
-			BasicBlock *bb_fail = vec_bb[0];
-			BR_COND(bb_fail, vec_bb[1], ICMP_EQ(SHR(sel, CONST16(2)), CONST16(0))); // sel == NULL
-			cpu->bb = vec_bb[1];
-			Value *desc = read_seg_desc_emit(cpu, sel, bb_fail)[1];
-			Value *dpl = TRUNC16(SHR(AND(desc, CONST64(SEG_DESC_DPL)), CONST64(45)));
-			BR_COND(bb_fail, vec_bb[2], OR(ICMP_EQ(AND(desc, CONST64(SEG_DESC_S)), CONST64(0)), // system desc
-				AND(ICMP_NE(AND(desc, CONST64(SEG_DESC_TYC)), CONST64(0xC0000000000)), // code, conf desc
-					OR(ICMP_UGT(CONST16(cpu->cpu_ctx.hflags & HFLG_CPL), dpl), ICMP_UGT(AND(sel, CONST16(3)), dpl))))); // cpl > dpl || rpl > dpl
-			cpu->bb = vec_bb[2];
 			if (instr.mnemonic == ZYDIS_MNEMONIC_VERR) {
-				BR_COND(bb_fail, vec_bb[3], ICMP_EQ(AND(desc, CONST64(SEG_DESC_DCRW)), CONST64(0x80000000000))); // code, exec only
+				Function *verr_helper = cast<Function>(cpu->mod->getOrInsertFunction("verr_helper", getVoidType(), cpu->ptr_cpu_ctx->getType(),
+					getIntegerType(16), getIntegerType(32)).getCallee());
+				CallInst::Create(verr_helper, { cpu->ptr_cpu_ctx, sel, cpu->instr_eip }, "", cpu->bb);
 			}
 			else {
-				BR_COND(bb_fail, vec_bb[3], ICMP_NE(AND(desc, CONST64(SEG_DESC_DCRW)), CONST64(0x20000000000))); // data, r/w
+				Function *verw_helper = cast<Function>(cpu->mod->getOrInsertFunction("verw_helper", getVoidType(), cpu->ptr_cpu_ctx->getType(),
+					getIntegerType(16), getIntegerType(32)).getCallee());
+				CallInst::Create(verw_helper, { cpu->ptr_cpu_ctx, sel, cpu->instr_eip }, "", cpu->bb);
 			}
-			cpu->bb = vec_bb[3];
-			Value *new_sfd = XOR(LD_SF(), CONST32(0));
-			Value *new_pdb = SHL(XOR(AND(XOR(LD_FLG_RES(), SHR(LD_FLG_AUX(), CONST32(8))), CONST32(0xFF)), CONST32(0)), CONST32(8));
-			ST_FLG_AUX(OR(AND(LD_FLG_AUX(), CONST32(0xFFFF00FE)), OR(new_sfd, new_pdb)));
-			ST_FLG_RES(CONST32(0));
-			BR_UNCOND(vec_bb[4]);
-			cpu->bb = bb_fail;
-			ST_FLG_RES(OR(LD_FLG_RES(), CONST32(0x100)));
-			BR_UNCOND(vec_bb[4]);
-			cpu->bb = vec_bb[4];
 		}
 		break;
 
@@ -5345,7 +5622,16 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			case 0x96:
 			case 0x97: {
 				Value *reg, *val, *reg_dst;
-				reg = (size_mode == SIZE32) ? GEP_R32(EAX_idx) : GEP_R16(EAX_idx);
+				switch (size_mode)
+				{
+				case SIZE32:
+					reg = GEP_REG_idx(EAX_idx);
+					break;
+
+				case SIZE16:
+					reg = GEP_REG_idx(EAX_idx);
+					break;
+				}
 				reg_dst = GET_REG(OPNUM_DST);
 				val = LD_REG_val(reg_dst);
 				ST_REG_val(LD_REG_val(reg), reg_dst);
@@ -5439,19 +5725,44 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 	// update the eip if we stopped decoding without a terminating instr
 	if ((translate_next == 1) && (DISAS_FLG_PAGE_CROSS | DISAS_FLG_ONE_INSTR) != 0) {
-		ST_R32(CONST32(pc - cpu_ctx->regs.cs_hidden.base), EIP_idx);
+		ST_REG_idx(CONST32(pc - cpu_ctx->regs.cs_hidden.base), EIP_idx);
 	}
 
-	// unconditionally jump to the exp handler if we need to service a debug trap
-	if (cpu->cpu_flags & CPU_DBG_TRAP) {
-		Value *tlb_idx = GEP(cpu->ptr_tlb, CONST32(cpu->cpu_ctx.exp_info.exp_data.fault_addr >> PAGE_SHIFT));
-		ST(tlb_idx, OR(LD(tlb_idx), CONST32(TLB_WATCH)));
-		raise_exp_inline_emit(cpu, std::vector<Value *> { CONST32(0), CONST16(0), CONST16(EXP_DB), LD_R32(EIP_idx) });
-		cpu->bb = getBB();
+	// TC_FLG_INDIRECT, TC_FLG_DIRECT and TC_FLG_DST_ONLY already check for rf/single step, so we only need to check them here with
+	// TC_FLG_COND_DST_ONLY and if no linking code was emitted
+	if ((cpu->tc->flags & TC_FLG_COND_DST_ONLY) || ((cpu->tc->flags & TC_FLG_LINK_MASK) == 0)) {
+		check_rf_single_step_emit(cpu);
 	}
 }
 
-template<typename T>
+static translated_code_t *
+cpu_dbg_int(cpu_ctx_t *cpu_ctx)
+{
+	// this is called when the user closes the debugger window
+	throw lc86_exp_abort("The debugger was closed", lc86_status::success);
+}
+
+static translated_code_t *
+cpu_do_int(cpu_ctx_t *cpu_ctx)
+{
+	// hw interrupts not implemented yet
+	throw lc86_exp_abort("Hardware interrupts are not implemented yet", lc86_status::internal_error);
+}
+
+// forward declare for cpu_main_loop
+translated_code_t *tc_run_code(cpu_ctx_t *cpu_ctx, translated_code_t *tc);
+
+template<bool is_tramp>
+void cpu_suppress_trampolines(cpu_t *cpu)
+{
+	if constexpr (is_tramp) {
+		// we need to remove the HFLG_TRAMP after we have searched the tc cache, but before executing the guest code, so that successive tc's
+		// can still call hooks, if the trampolined function happens to make calls to other hooked functions internally
+		cpu->cpu_ctx.hflags &= ~HFLG_TRAMP;
+	}
+}
+
+template<bool is_tramp, bool is_trap, typename T>
 void cpu_main_loop(cpu_t *cpu, T &&lambda)
 {
 	translated_code_t *prev_tc = nullptr, *ptr_tc = nullptr;
@@ -5468,29 +5779,34 @@ void cpu_main_loop(cpu_t *cpu, T &&lambda)
 		}
 		catch (host_exp_t type) {
 			assert((type == host_exp_t::pf_exp) || (type == host_exp_t::de_exp));
+			cpu_suppress_trampolines<is_tramp>(cpu);
 
 			// this is either a page fault or a debug exception. In both cases, we have to call the exception handler
+			retry_exp:
 			try {
 				// the exception handler always returns nullptr
-				prev_tc = cpu->cpu_ctx.exp_fn(&cpu->cpu_ctx);
+				prev_tc = cpu_raise_exception(&cpu->cpu_ctx);
 			}
 			catch (host_exp_t type) {
-				assert(type == host_exp_t::pf_exp);
+				assert((type == host_exp_t::pf_exp) || (type == host_exp_t::de_exp));
 
-				// page fault while delivering another exception
-				// NOTE: we abort because we don't support double/triple faults yet
-				LIB86CPU_ABORT();
+				// page fault or debug exception while delivering another exception
+				goto retry_exp;
 			}
 
 			goto retry;
 		}
 
-		ptr_tc = tc_cache_search(cpu, pc);
+		if constexpr (!is_trap) {
+			// if we are executing a trapped instr, we must always emit a new tc to run it and not consider other tc's in the cache. Doing so avoids having to invalidate
+			// the tc in the cache that contains the trapped instr
+			ptr_tc = tc_cache_search(cpu, pc);
+		}
 
 		if (ptr_tc == nullptr) {
 
 			// code block for this pc not present, we need to translate new code
-			std::shared_ptr<translated_code_t> tc(new translated_code_t(cpu));
+			std::unique_ptr<translated_code_t> tc(new translated_code_t(cpu));
 			cpu->ctx = new LLVMContext();
 			if (cpu->ctx == nullptr) {
 				LIB86CPU_ABORT();
@@ -5512,22 +5828,36 @@ void cpu_main_loop(cpu_t *cpu, T &&lambda)
 			disas_ctx.flags = ((cpu->cpu_ctx.hflags & HFLG_CS32) >> CS32_SHIFT) |
 				((cpu->cpu_ctx.hflags & HFLG_PE_MODE) >> (PE_MODE_SHIFT - 1)) |
 				(cpu->cpu_flags & CPU_DISAS_ONE) |
-				((cpu->cpu_ctx.regs.eflags & RF_MASK) >> 9); // if rf is set, we need to clear it after the first instr executed
+				((cpu->cpu_flags & CPU_SINGLE_STEP) >> 3) |
+				((cpu->cpu_ctx.regs.eflags & RF_MASK) >> 9) | // if rf is set, we need to clear it after the first instr executed
+				((cpu->cpu_ctx.regs.eflags & TF_MASK) >> 1); // if tf is set, we need to raise a DB exp after every instruction
 			disas_ctx.virt_pc = virt_pc;
 			disas_ctx.pc = pc;
 
-			auto it = cpu->hook_map.find(disas_ctx.virt_pc);
-			if (it != cpu->hook_map.end()) {
-				// XXX: putting a hook on the addr of an instr that causes a debug exception will cause the watchpoint not to be
-				// reinstalled. That's because we will skip the call to cpu_translate below, which reinstalls it later
-				cpu->instr_eip = CONST32(disas_ctx.virt_pc - cpu->cpu_ctx.regs.cs_hidden.base);
-				hook_emit(cpu, it->second.get());
-				cpu->tc->flags |= TC_FLG_HOOK;
-				it->second->hook_tc_flags = tc;
+			if constexpr (!is_trap) {
+				const auto it = cpu->hook_map.find(disas_ctx.virt_pc);
+				bool take_hook;
+				if constexpr (is_tramp) {
+					take_hook = (it != cpu->hook_map.end()) && !(cpu->cpu_ctx.hflags & HFLG_TRAMP);
+				}
+				else {
+					take_hook = it != cpu->hook_map.end();
+				}
+
+				if (take_hook) {
+					cpu->instr_eip = CONST32(disas_ctx.virt_pc - cpu->cpu_ctx.regs.cs_hidden.base);
+					hook_emit(cpu, it->second.get());
+				}
+				else {
+					// start guest code translation
+					cpu_translate(cpu, &disas_ctx);
+				}
 			}
 			else {
-				// start guest code translation
+				// don't take hooks if we are executing a trapped instr. Otherwise, if the trapped instr is also hooked, we will take the hook instead of executing it
 				cpu_translate(cpu, &disas_ctx);
+				raise_exp_inline_emit(cpu, CONST32(0), CONST16(0), CONST16(EXP_DB), LD_R32(EIP_idx));
+				cpu->bb = getBB();
 			}
 
 			create_tc_epilogue(cpu);
@@ -5556,13 +5886,16 @@ void cpu_main_loop(cpu_t *cpu, T &&lambda)
 			cpu->jit->add_ir_module(std::move(tsm));
 
 			tc->pc = pc;
+			tc->virt_pc = virt_pc;
 			tc->cs_base = cpu->cpu_ctx.regs.cs_hidden.base;
-			tc->cpu_flags = cpu->cpu_ctx.hflags | (cpu->cpu_ctx.regs.eflags & (TF_MASK | IOPL_MASK | RF_MASK | AC_MASK));
+			tc->cpu_flags = (cpu->cpu_ctx.hflags & HFLG_CONST) | (cpu->cpu_ctx.regs.eflags & EFLAGS_CONST);
 			tc->ptr_code = reinterpret_cast<entry_t>(cpu->jit->lookup("main")->getAddress());
 			assert(tc->ptr_code);
 			tc->jmp_offset[0] = reinterpret_cast<entry_t>(cpu->jit->lookup("exit")->getAddress());
 			tc->jmp_offset[1] = tc->jmp_offset[2] = tc->jmp_offset[0];
 			assert(tc->jmp_offset[0]);
+			tc->jmp_offset[3] = &cpu_dbg_int;
+			tc->jmp_offset[4] = &cpu_do_int;
 
 			// now remove the function symbol names so that we can reuse them for other modules
 			cpu->jit->remove_symbols(std::vector<std::string> { "main", "exit" });
@@ -5579,40 +5912,48 @@ void cpu_main_loop(cpu_t *cpu, T &&lambda)
 			if (disas_ctx.flags & (DISAS_FLG_PAGE_CROSS | DISAS_FLG_ONE_INSTR)) {
 				if (cpu->cpu_flags & CPU_FORCE_INSERT) {
 					if ((cpu->num_tc) == CODE_CACHE_MAX_SIZE) {
-						tc_cache_clear(cpu);
+						tc_cache_purge(cpu);
 						prev_tc = nullptr;
 					}
 					tc_cache_insert(cpu, pc, std::move(tc));
 				}
 
-				cpu->cpu_flags &= ~(CPU_DISAS_ONE | CPU_ALLOW_CODE_WRITE | CPU_FORCE_INSERT | CPU_DBG_TRAP);
+				cpu_suppress_trampolines<is_tramp>(cpu);
+				cpu->cpu_flags &= ~(CPU_DISAS_ONE | CPU_ALLOW_CODE_WRITE | CPU_FORCE_INSERT);
 				tc_run_code(&cpu->cpu_ctx, ptr_tc);
 				prev_tc = nullptr;
 				continue;
 			}
 			else {
 				if ((cpu->num_tc) == CODE_CACHE_MAX_SIZE) {
-					tc_cache_clear(cpu);
+					tc_cache_purge(cpu);
 					prev_tc = nullptr;
 				}
 				tc_cache_insert(cpu, pc, std::move(tc));
 			}
 		}
 
+		cpu_suppress_trampolines<is_tramp>(cpu);
+
 		// see if we can link the previous tc with the current one
 		if (prev_tc != nullptr) {
 			switch (prev_tc->flags & TC_FLG_LINK_MASK)
 			{
 			case 0:
-			case TC_FLG_INDIRECT:
 				break;
 
 			case TC_FLG_DST_ONLY:
+			case TC_FLG_COND_DST_ONLY:
 				tc_link_dst_only(prev_tc, ptr_tc);
 				break;
 
 			case TC_FLG_DIRECT:
 				tc_link_direct(prev_tc, ptr_tc);
+				break;
+
+			case TC_FLG_RET:
+			case TC_FLG_INDIRECT:
+				cpu->ibtc.insert_or_assign(virt_pc, ptr_tc);
 				break;
 
 			default:
@@ -5624,271 +5965,105 @@ void cpu_main_loop(cpu_t *cpu, T &&lambda)
 	}
 }
 
+translated_code_t *
+tc_run_code(cpu_ctx_t *cpu_ctx, translated_code_t *tc)
+{
+	try {
+		// run the translated code
+		return tc->ptr_code(cpu_ctx);
+	}
+	catch (host_exp_t type) {
+		switch (type)
+		{
+		case host_exp_t::pf_exp: {
+			// page fault while excecuting the translated code
+			retry_exp:
+			try {
+				// the exception handler always returns nullptr
+				return cpu_raise_exception(cpu_ctx);
+			}
+			catch (host_exp_t type) {
+				assert((type == host_exp_t::pf_exp) || (type == host_exp_t::de_exp));
+
+				// page fault or debug exception while delivering another exception
+				goto retry_exp;
+			}
+		}
+		break;
+
+		case host_exp_t::de_exp: {
+			// debug exception trap (mem/io r/w watch) while excecuting the translated code.
+			// We set CPU_DBG_TRAP, so that we can execute the trapped instruction without triggering again a de exp,
+			// and then jump to the debug handler. Note thate eip points to the trapped instr, so we can execute it.
+			assert(cpu_ctx->exp_info.exp_data.idx == EXP_DB);
+
+			cpu_ctx->cpu->cpu_flags |= CPU_DISAS_ONE;
+			cpu_ctx->hflags |= HFLG_DBG_TRAP;
+			cpu_ctx->regs.eip = cpu_ctx->exp_info.exp_data.eip;
+			// run the main loop only once, since we only execute the trapped instr
+			int i = 0;
+			cpu_main_loop<false, true>(cpu_ctx->cpu, [&i]() { return i++ == 0; });
+		}
+		[[fallthrough]];
+
+		case host_exp_t::cpu_mode_changed:
+		case host_exp_t::halt_tc:
+			return nullptr;
+
+		default:
+			LIB86CPU_ABORT_msg("Unknown host exception in %s", __func__);
+		}
+	}
+}
+
 lc86_status
 cpu_start(cpu_t *cpu)
 {
-	gen_exp_fn(cpu);
-
+	// guard against the case gen_int_fn raises an exception before the debugger is even initialized
 	try {
-		cpu_main_loop(cpu, []() { return true; });
+		gen_int_fn(cpu);
 	}
 	catch (lc86_exp_abort &exp) {
 		last_error = exp.what();
 		return exp.get_code();
 	}
 
+	if (cpu->cpu_flags & CPU_DBG_PRESENT) {
+		std::promise<bool> promise;
+		std::future<bool> fut = promise.get_future();
+		std::thread(dbg_main_wnd, cpu, std::ref(promise)).detach();
+		bool has_err = fut.get();
+		if (has_err) {
+			return lc86_status::internal_error;
+		}
+		// wait until the debugger continues execution, so that users have a chance to set breakpoints and/or inspect the guest code
+		guest_running.wait(false);
+	}
+
+	try {
+		cpu_main_loop<false, false>(cpu, []() { return true; });
+	}
+	catch (lc86_exp_abort &exp) {
+		if (cpu->cpu_flags & CPU_DBG_PRESENT) {
+			dbg_should_close();
+		}
+
+		last_error = exp.what();
+		return exp.get_code();
+	}
+
+	assert(0);
+
 	return set_last_error(lc86_status::internal_error);
 }
 
 void
-trmp_stack_i32(cpu_t *cpu, std::any &value, std::vector<uint32_t *> &vec)
+cpu_exec_trampoline(cpu_t *cpu, const uint32_t ret_eip)
 {
-	*(vec[0]) -= 4;
-	mem_write<uint32_t>(cpu, *vec[0], std::any_cast<uint32_t>(value), *vec[1], 0, nullptr);
-	*(vec[1]) += 1; // simulates a push imm32 instruction
+	// set the trampoline flag, so that we can call the trampoline tc instead of the hook tc
+	cpu->cpu_ctx.hflags |= HFLG_TRAMP;
+	cpu_main_loop<true, false>(cpu, [cpu, ret_eip]() { return cpu->cpu_ctx.regs.eip != ret_eip; });
 }
 
-void
-trmp_stack_i64(cpu_t *cpu, std::any &value, std::vector<uint32_t *> &vec)
-{
-	*(vec[0]) -= 8;
-	mem_write<uint64_t>(cpu, *vec[0], std::any_cast<uint64_t>(value), *vec[1], 0, nullptr);
-	*(vec[1]) += 2; // simulates two push imm32 instructions
-}
-
-void
-trmp_ecx_i32(cpu_t *cpu, std::any &value, std::vector<uint32_t *> &vec)
-{
-	cpu->cpu_ctx.regs.ecx = std::any_cast<uint32_t>(value);
-	*(vec[1]) += 5; // simulates a mov ecx,imm32 instruction
-}
-
-void
-trmp_ecx_i8(cpu_t *cpu, std::any &value, std::vector<uint32_t *> &vec)
-{
-	cpu->cpu_ctx.regs.ecx |= std::any_cast<uint8_t>(value);
-	*(vec[1]) += 2; // simulates a mov cl,imm8 instruction
-}
-
-void
-trmp_edx_i32(cpu_t *cpu, std::any &value, std::vector<uint32_t *> &vec)
-{
-	cpu->cpu_ctx.regs.edx = std::any_cast<uint32_t>(value);
-	*(vec[1]) += 5; // simulates a mov edx,imm32 instruction
-}
-
-void
-trmp_edx_i8(cpu_t *cpu, std::any &value, std::vector<uint32_t *> &vec)
-{
-	cpu->cpu_ctx.regs.edx |= std::any_cast<uint8_t>(value);
-	*(vec[1]) += 2; // simulates a mov dl,imm8 instruction
-}
-
-lc86_status
-cpu_exec_trampoline(cpu_t *cpu, addr_t addr, hook *hook_ptr, std::any &ret, std::vector<std::any> &args)
-{
-	if (hook_ptr->trmp_vec.empty()) {
-		// code for calling the trampoline is not present, we need to generate it first. This will happen when the trampoline
-		// for this hook is called for the first time
-
-		hook_ptr->trmp_vec.resize(hook_ptr->info.args.size(), nullptr);
-		switch (hook_ptr->o_conv)
-		{
-		case call_conv::x86_cdecl: {
-			uint32_t arg_size = 0;
-			for (unsigned i = hook_ptr->info.args.size() - 1; i > 0; i--) {
-				if (hook_ptr->info.args[i] == arg_types::i64) {
-					hook_ptr->trmp_vec[i] = trmp_stack_i64;
-					arg_size += 8;
-				}
-				else {
-					hook_ptr->trmp_vec[i] = trmp_stack_i32;
-					arg_size += 4;
-				}
-			}
-			hook_ptr->cdecl_arg_size = arg_size;
-		}
-		break;
-
-		case call_conv::x86_stdcall: {
-			for (unsigned i = hook_ptr->info.args.size() - 1; i > 0; i--) {
-				if (hook_ptr->info.args[i] == arg_types::i64) {
-					hook_ptr->trmp_vec[i] = trmp_stack_i64;
-				}
-				else {
-					hook_ptr->trmp_vec[i] = trmp_stack_i32;
-				}
-			}
-		}
-		break;
-
-		case call_conv::x86_fastcall: {
-			int num_reg_args = 0;
-			bool use_stack = false;
-			for (unsigned i = 1; i < hook_ptr->info.args.size(); i++) {
-				if (use_stack || (hook_ptr->info.args[i] == arg_types::i64)) {
-					continue;
-				}
-				else {
-					switch (hook_ptr->info.args[i])
-					{
-					case arg_types::i8:
-						hook_ptr->trmp_vec[i] = num_reg_args ? trmp_edx_i8 : trmp_ecx_i8;
-						break;
-
-					case arg_types::i16:
-					case arg_types::i32:
-					case arg_types::ptr:
-					case arg_types::ptr2:
-						hook_ptr->trmp_vec[i] = num_reg_args ? trmp_edx_i32 : trmp_ecx_i32;
-						break;
-
-					default:
-						LIB86CPU_ABORT_msg("Unknown or invalid hook argument type specified");
-					}
-
-					num_reg_args++;
-					if (num_reg_args == 2) {
-						use_stack = true;
-					}
-				}
-			}
-
-			for (unsigned i = hook_ptr->info.args.size() - 1; i > 0; i--) {
-				if (hook_ptr->trmp_vec[i] == nullptr) {
-					if (hook_ptr->info.args[i] == arg_types::i64) {
-						hook_ptr->trmp_vec[i] = trmp_stack_i64;
-					}
-					else {
-						hook_ptr->trmp_vec[i] = trmp_stack_i32;
-					}
-				}
-			}
-		}
-		break;
-
-		default:
-			LIB86CPU_ABORT_msg("Unknown or invalid hook calling convention specified");
-		}
-
-		hook_ptr->trmp_vec.erase(hook_ptr->trmp_vec.begin());
-		hook_ptr->trmp_fn = [hook_ptr, addr](cpu_t *cpu, std::vector<std::any> &args, uint32_t *ret_eip) {
-			uint32_t eip = cpu->cpu_ctx.regs.eip;
-			uint32_t stack = cpu->cpu_ctx.regs.esp + cpu->cpu_ctx.regs.ss_hidden.base;
-			std::vector<uint32_t *> vec { &stack, &eip };
-			for (unsigned i = args.size(); i > 0 ; i--) {
-				hook_ptr->trmp_vec[i - 1](cpu, args[i - 1], vec);
-			}
-
-			stack -= 4;
-			mem_write<uint32_t>(cpu, stack, eip + 5, eip, 0, nullptr); // simulates a near, relative call instruction
-			*ret_eip = (eip + 5);
-			cpu->cpu_ctx.regs.eip = addr;
-			cpu->cpu_ctx.regs.esp = stack - cpu->cpu_ctx.regs.ss_hidden.base;
-		};
-	}
-
-	uint32_t ret_eip;
-	uint32_t ecx = cpu->cpu_ctx.regs.ecx;
-	uint32_t edx = cpu->cpu_ctx.regs.edx;
-	try {
-		// setup the stack to call the trampoline
-		hook_ptr->trmp_fn(cpu, args, &ret_eip);
-	}
-	catch (host_exp_t type) {
-		assert((type == host_exp_t::pf_exp) || (type == host_exp_t::de_exp));
-
-		// page fault while calling the trampoline. We return because we can't handle an exception here. If this happens,
-		// it probably means there is a stack overflow condition in the guest stack. Alternatively, this can also be a debug excepion
-		cpu->cpu_ctx.regs.ecx = ecx;
-		cpu->cpu_ctx.regs.edx = edx;
-		return set_last_error(lc86_status::guest_exp);
-	}
-	catch (std::bad_any_cast e) {
-		// this will happen if the client passes an argument type not supported by arg_types
-
-		cpu->cpu_ctx.regs.ecx = ecx;
-		cpu->cpu_ctx.regs.edx = edx;
-		LOG(log_level::warn, "Exception thrown while calling a trampoline with error string: %s", e.what());
-		return set_last_error(lc86_status::invalid_parameter);
-	}
-
-	int i = 0;
-	auto hook_node = cpu->hook_map.extract(addr);
-	cpu->cpu_flags |= (CPU_DISAS_ONE | CPU_FORCE_INSERT);
-	if (!(hook_ptr->hook_tc_flags.expired())) {
-		hook_ptr->hook_tc_flags.lock()->cpu_flags |= CPU_IGNORE_TC;
-	}
-	if (!(hook_ptr->trmp_tc_flags.expired())) {
-		hook_ptr->trmp_tc_flags.lock()->cpu_flags &= ~CPU_IGNORE_TC;
-	}
-
-	cpu_main_loop(cpu, [&i]() { return i++ == 0; });
-
-	if (hook_ptr->trmp_tc_flags.expired()) {
-		const auto &tc_ptr = [](cpu_t *cpu, uint32_t pc) {
-			uint32_t flags = cpu->cpu_ctx.hflags | (cpu->cpu_ctx.regs.eflags & (TF_MASK | IOPL_MASK | RF_MASK | AC_MASK));
-			uint32_t idx = tc_hash(pc);
-			auto it = cpu->code_cache[idx].begin();
-			while (it != cpu->code_cache[idx].end()) {
-				translated_code_t *tc = it->get();
-				if (tc->cs_base == cpu->cpu_ctx.regs.cs_hidden.base &&
-					tc->pc == pc &&
-					tc->cpu_flags == flags) {
-					return *it;
-				}
-				it++;
-			}
-
-			return std::shared_ptr<translated_code_t>();
-			}(cpu, addr);
-
-		if (tc_ptr) {
-			assert(tc_ptr->size != 0);
-			tc_ptr->cpu_flags |= CPU_IGNORE_TC;
-			hook_ptr->trmp_tc_flags = tc_ptr;
-		}
-	}
-	else {
-		hook_ptr->trmp_tc_flags.lock()->cpu_flags |= CPU_IGNORE_TC;
-	}
-	if (!(hook_ptr->hook_tc_flags.expired())) {
-		hook_ptr->hook_tc_flags.lock()->cpu_flags &= ~CPU_IGNORE_TC;
-	}
-	cpu->hook_map.insert(std::move(hook_node));
-
-	cpu_main_loop(cpu, [cpu, ret_eip]() { return cpu->cpu_ctx.regs.eip != ret_eip; });
-
-	if (hook_ptr->o_conv == call_conv::x86_cdecl) {
-		// with cdecl, we also have to clean the stack ourselves
-
-		cpu->cpu_ctx.regs.esp += hook_ptr->cdecl_arg_size;
-	}
-
-	switch (hook_ptr->info.args[0])
-	{
-	case arg_types::void_:
-		ret.reset();
-		break;
-
-	case arg_types::i8:
-		ret = static_cast<uint8_t>(cpu->cpu_ctx.regs.eax & 0xFF);
-		break;
-
-	case arg_types::i16:
-	case arg_types::i32:
-	case arg_types::ptr:
-	case arg_types::ptr2:
-		ret = cpu->cpu_ctx.regs.eax;
-		break;
-
-	case arg_types::i64:
-		ret = (cpu->cpu_ctx.regs.eax | (static_cast<uint64_t>(cpu->cpu_ctx.regs.edx) << 32));
-		break;
-
-	default:
-		LIB86CPU_ABORT_msg("Unknown hook return type specified");
-	}
-
-	return lc86_status::success;
-}
+template translated_code_t *cpu_raise_exception<true>(cpu_ctx_t *cpu_ctx);
+template translated_code_t *cpu_raise_exception<false>(cpu_ctx_t *cpu_ctx);

@@ -5,180 +5,13 @@
  * the libcpu developers  Copyright (c) 2009-2010
  */
 
+#include "llvm-c/Core.h"
 #include "jit.h"
 #include "internal.h"
 #include "memory.h"
 #include "clock.h"
 #include <fstream>
 
-
-lc86_status
-cpu_new(size_t ramsize, cpu_t *&out)
-{
-	LOG(log_level::info, "Creating new cpu...");
-
-	out = nullptr;
-	cpu_t *cpu = new cpu_t();
-	if (cpu == nullptr) {
-		return set_last_error(lc86_status::no_memory);
-	}
-
-	if ((ramsize % PAGE_SIZE) != 0) {
-		cpu_free(cpu);
-		return set_last_error(lc86_status::invalid_parameter);
-	}
-
-	cpu->cpu_ctx.ram = new uint8_t[ramsize];
-	if (cpu->cpu_ctx.ram == nullptr) {
-		cpu_free(cpu);
-		return set_last_error(lc86_status::no_memory);
-	}
-
-	cpu_init(cpu);
-	tsc_init(cpu);
-	// XXX: eventually, the user should be able to set the instruction formatting
-	set_instr_format(cpu);
-
-	std::unique_ptr<memory_region_t<addr_t>> mem_region(new memory_region_t<addr_t>);
-	cpu->memory_space_tree = interval_tree<addr_t, std::unique_ptr<memory_region_t<addr_t>>>::create();
-	mem_region->start = 0;
-	mem_region->end = UINT32_MAX;
-	cpu->memory_space_tree->insert(mem_region->start, mem_region->end, std::move(mem_region));
-	std::unique_ptr<memory_region_t<port_t>> io_region(new memory_region_t<port_t>);
-	cpu->io_space_tree = interval_tree<port_t, std::unique_ptr<memory_region_t<port_t>>>::create();
-	io_region->start = 0;
-	io_region->end = UINT16_MAX;
-	cpu->io_space_tree->insert(io_region->start, io_region->end, std::move(io_region));
-
-	cpu->jit = std::move(lc86_jit::create(cpu));
-
-	// check if FP80 is supported by this architecture
-	std::string data_layout = cpu->dl->getStringRepresentation();
-	if (data_layout.find("f80") != std::string::npos) {
-		LOG(log_level::info, "FP80 supported.");
-		cpu->cpu_flags |= CPU_FLAG_FP80;
-	}
-
-	LOG(log_level::info, "Created new cpu \"%s\"", cpu->cpu_name);
-
-	cpu->cpu_ctx.cpu = out = cpu;
-	return lc86_status::success;
-}
-
-void
-cpu_free(cpu_t *cpu)
-{
-	if (cpu->dl) {
-		delete cpu->dl;
-	}
-	if (cpu->cpu_ctx.ram) {
-		delete[] cpu->cpu_ctx.ram;
-	}
-
-	for (auto &bucket : cpu->code_cache) {
-		bucket.clear();
-	}
-
-	llvm_shutdown();
-
-	delete cpu;
-}
-
-lc86_status
-cpu_run(cpu_t *cpu)
-{
-	cpu_sync_state(cpu);
-	return cpu_start(cpu);
-}
-
-void
-cpu_sync_state(cpu_t *cpu)
-{
-	tlb_flush(cpu, TLB_zero);
-	cpu->cpu_ctx.hflags = 0;
-	if (cpu->cpu_ctx.regs.cr0 & CR0_PE_MASK) {
-		cpu->cpu_ctx.hflags |= ((cpu->cpu_ctx.regs.cs & HFLG_CPL) | HFLG_PE_MODE);
-		if (cpu->cpu_ctx.regs.cs_hidden.flags & SEG_HIDDEN_DB) {
-			cpu->cpu_ctx.hflags |= HFLG_CS32;
-		}
-		if (cpu->cpu_ctx.regs.ss_hidden.flags & SEG_HIDDEN_DB) {
-			cpu->cpu_ctx.hflags |= HFLG_SS32;
-		}
-	}
-	if (cpu->cpu_ctx.regs.cr0 & CR0_EM_MASK) {
-		cpu->cpu_ctx.hflags |= HFLG_CR0_EM;
-	}
-}
-
-lc86_status
-cpu_set_flags(cpu_t *cpu, uint32_t flags)
-{
-	if (flags & ~(CPU_INTEL_SYNTAX | CPU_CODEGEN_OPTIMIZE | CPU_PRINT_IR | CPU_PRINT_IR_OPTIMIZED)) {
-		return set_last_error(lc86_status::invalid_parameter);
-	}
-
-	if ((flags & CPU_PRINT_IR_OPTIMIZED) && ((flags & CPU_CODEGEN_OPTIMIZE) == 0)) {
-		return set_last_error(lc86_status::invalid_parameter);
-	}
-
-	cpu->cpu_flags &= ~(CPU_INTEL_SYNTAX | CPU_CODEGEN_OPTIMIZE | CPU_PRINT_IR | CPU_PRINT_IR_OPTIMIZED);
-	cpu->cpu_flags |= flags;
-	// XXX: eventually, the user should be able to set the instruction formatting
-	set_instr_format(cpu);
-
-	return lc86_status::success;
-}
-
-void
-register_log_func(logfn_t logger)
-{
-	if (logger == nullptr) {
-		logfn = &discard_log;
-		instr_logfn = &discard_instr_log;
-	}
-	else {
-		logfn = logger;
-		instr_logfn = &log_instr;
-	}
-}
-
-std::string
-get_last_error()
-{
-	return last_error;
-}
-
-uint8_t *
-get_ram_ptr(cpu_t *cpu)
-{
-	return cpu->cpu_ctx.ram;
-}
-
-uint8_t *
-get_host_ptr(cpu_t *cpu, addr_t addr)
-{
-	try {
-		addr_t phys_addr = get_read_addr(cpu, addr, 0, 0);
-		memory_region_t<addr_t>* region = as_memory_search_addr<uint8_t>(cpu, phys_addr);
-
-		switch (region->type)
-		{
-		case mem_type::ram:
-			return static_cast<uint8_t *>(get_ram_host_ptr(cpu, region, phys_addr));
-
-		case mem_type::rom:
-			return static_cast<uint8_t *>(get_rom_host_ptr(cpu, region, phys_addr));
-		}
-
-		set_last_error(lc86_status::invalid_parameter);
-		return nullptr;
-	}
-	catch (host_exp_t type) {
-		assert((type == host_exp_t::pf_exp) || (type == host_exp_t::de_exp));
-		set_last_error(lc86_status::guest_exp);
-		return nullptr;
-	}
-}
 
 static void
 default_mmio_write_handler(addr_t addr, size_t size, const uint64_t value, void *opaque)
@@ -206,6 +39,243 @@ default_pmio_read_handler(addr_t addr, size_t size, void *opaque)
 	return std::numeric_limits<uint64_t>::max();
 }
 
+/*
+* cpu_new -> creates a new cpu instance. Only a single instance should exist at a time
+* ramsize: size in bytes of ram buffer internally created (must be a multiple of 4096)
+* out: returned cpu instance
+* (optional) debuggee: name of the debuggee program to run
+* ret: the status of the operation
+*/
+lc86_status
+cpu_new(size_t ramsize, cpu_t *&out, const char *debuggee)
+{
+	LOG(log_level::info, "Creating new cpu...");
+
+	out = nullptr;
+	cpu_t *cpu = new cpu_t();
+	if (cpu == nullptr) {
+		return set_last_error(lc86_status::no_memory);
+	}
+
+	if ((ramsize % PAGE_SIZE) != 0) {
+		cpu_free(cpu);
+		return set_last_error(lc86_status::invalid_parameter);
+	}
+
+	cpu->cpu_ctx.ram = new uint8_t[ramsize];
+	if (cpu->cpu_ctx.ram == nullptr) {
+		cpu_free(cpu);
+		return set_last_error(lc86_status::no_memory);
+	}
+
+	cpu_init(cpu);
+	tsc_init(cpu);
+	// XXX: eventually, the user should be able to set the instruction formatting
+	set_instr_format(cpu);
+	cpu->dbg_name = debuggee ? debuggee : "";
+
+	std::unique_ptr<memory_region_t<addr_t>> mem_region(new memory_region_t<addr_t>);
+	cpu->memory_space_tree = interval_tree<addr_t, std::unique_ptr<memory_region_t<addr_t>>>::create();
+	mem_region->start = 0;
+	mem_region->end = UINT32_MAX;
+	cpu->memory_space_tree->insert(mem_region->start, mem_region->end, std::move(mem_region));
+	std::unique_ptr<memory_region_t<port_t>> io_region(new memory_region_t<port_t>);
+	cpu->io_space_tree = interval_tree<port_t, std::unique_ptr<memory_region_t<port_t>>>::create();
+	io_region->start = 0;
+	io_region->end = UINT16_MAX;
+	io_region->read_handler = default_pmio_read_handler;
+	io_region->write_handler = default_pmio_write_handler;
+	cpu->io_space_tree->insert(io_region->start, io_region->end, std::move(io_region));
+
+	try {
+		cpu->jit = std::move(lc86_jit::create(cpu));
+	}
+	catch (lc86_exp_abort &exp) {
+		cpu_free(cpu);
+		last_error = exp.what();
+		return exp.get_code();
+	}
+
+	// check if FP80 is supported by this architecture
+	std::string data_layout = cpu->dl->getStringRepresentation();
+	if (data_layout.find("f80") != std::string::npos) {
+		LOG(log_level::info, "FP80 supported.");
+		cpu->cpu_flags |= CPU_FLAG_FP80;
+	}
+
+	LOG(log_level::info, "Created new cpu \"%s\"", cpu->cpu_name);
+
+	cpu->cpu_ctx.cpu = out = cpu;
+	return lc86_status::success;
+}
+
+/*
+* cpu_free -> destroys a cpu instance. Only call this after cpu_run has returned
+* cpu: a valid cpu instance
+* ret: nothing
+*/
+void
+cpu_free(cpu_t *cpu)
+{
+	if (cpu->dl) {
+		delete cpu->dl;
+	}
+	if (cpu->cpu_ctx.ram) {
+		delete[] cpu->cpu_ctx.ram;
+	}
+
+	for (auto &bucket : cpu->code_cache) {
+		bucket.clear();
+	}
+
+	LLVMShutdown();
+
+	delete cpu;
+
+	// NOTE: only call this after delete cpu;. This, because destroying the cpu destroys the jit, which in turn cause llvm to call ~SectionMemoryManager,
+	// That destructor internally calls releaseMappedMemory, which will then attempt to release the already deleted memory of the JITed code
+	g_mapper.destroy_all_blocks();
+}
+
+/*
+* cpu_run -> starts the emulation. Only returns when there is an error in lib86cpu
+* cpu: a valid cpu instance
+* ret: nothing
+*/
+lc86_status
+cpu_run(cpu_t *cpu)
+{
+	cpu_sync_state(cpu);
+	return cpu_start(cpu);
+}
+
+/*
+* cpu_sync_state -> synchronizes internal cpu flags with the current cpu state. Only call this before cpu_run
+* cpu: a valid cpu instance
+* ret: nothing
+*/
+void
+cpu_sync_state(cpu_t *cpu)
+{
+	tlb_flush(cpu, TLB_zero);
+	cpu->cpu_ctx.hflags = 0;
+	if (cpu->cpu_ctx.regs.cr0 & CR0_PE_MASK) {
+		cpu->cpu_ctx.hflags |= ((cpu->cpu_ctx.regs.cs & HFLG_CPL) | HFLG_PE_MODE);
+		if (cpu->cpu_ctx.regs.cs_hidden.flags & SEG_HIDDEN_DB) {
+			cpu->cpu_ctx.hflags |= HFLG_CS32;
+		}
+		if (cpu->cpu_ctx.regs.ss_hidden.flags & SEG_HIDDEN_DB) {
+			cpu->cpu_ctx.hflags |= HFLG_SS32;
+		}
+	}
+	if (cpu->cpu_ctx.regs.cr0 & CR0_EM_MASK) {
+		cpu->cpu_ctx.hflags |= HFLG_CR0_EM;
+	}
+}
+
+/*
+* cpu_set_flags -> sets lib86cpu flags with the current cpu state. Only call this before cpu_run
+* cpu: a valid cpu instance
+* ret: the status of the operation
+*/
+lc86_status
+cpu_set_flags(cpu_t *cpu, uint32_t flags)
+{
+	if (flags & ~(CPU_INTEL_SYNTAX | CPU_CODEGEN_OPTIMIZE | CPU_PRINT_IR | CPU_PRINT_IR_OPTIMIZED | CPU_DBG_PRESENT)) {
+		return set_last_error(lc86_status::invalid_parameter);
+	}
+
+	if ((flags & CPU_PRINT_IR_OPTIMIZED) && ((flags & CPU_CODEGEN_OPTIMIZE) == 0)) {
+		return set_last_error(lc86_status::invalid_parameter);
+	}
+
+	cpu->cpu_flags &= ~(CPU_INTEL_SYNTAX | CPU_CODEGEN_OPTIMIZE | CPU_PRINT_IR | CPU_PRINT_IR_OPTIMIZED | CPU_DBG_PRESENT);
+	cpu->cpu_flags |= flags;
+	// XXX: eventually, the user should be able to set the instruction formatting
+	set_instr_format(cpu);
+
+	return lc86_status::success;
+}
+
+/*
+* register_log_func -> registers a log function to receive log events from lib86cpu
+* logger: the function to call
+* ret: nothing
+*/
+void
+register_log_func(logfn_t logger)
+{
+	if (logger == nullptr) {
+		logfn = &discard_log;
+		instr_logfn = &discard_instr_log;
+	}
+	else {
+		logfn = logger;
+		instr_logfn = &log_instr;
+	}
+}
+
+/*
+* get_last_error -> returns a string representation of the last lib86cpu error
+* ret: the error string
+*/
+std::string
+get_last_error()
+{
+	return last_error;
+}
+
+/*
+* get_ram_ptr -> returns a pointer to the internally allocated ram buffer. Do not modify its contents directly, but instead use the memory api
+* cpu: a valid cpu instance
+* ret: a pointer to the ram buffer
+*/
+uint8_t *
+get_ram_ptr(cpu_t *cpu)
+{
+	return cpu->cpu_ctx.ram;
+}
+
+/*
+* get_host_ptr -> returns a host pointer that maps the guest ram/rom at the specified address. This memory might not be contiguous in host memory
+* cpu: a valid cpu instance
+* addr: a guest virtual address pointing to a ram or rom region
+* ret: a host pointer to the specified guest address, or nullptr if the address doesn't map to ram/rom or a guest exception occurs
+*/
+uint8_t *
+get_host_ptr(cpu_t *cpu, addr_t addr)
+{
+	try {
+		addr_t phys_addr = get_read_addr(cpu, addr, 0, 0);
+		memory_region_t<addr_t>* region = as_memory_search_addr<uint8_t>(cpu, phys_addr);
+
+		switch (region->type)
+		{
+		case mem_type::ram:
+			return static_cast<uint8_t *>(get_ram_host_ptr(cpu, region, phys_addr));
+
+		case mem_type::rom:
+			return static_cast<uint8_t *>(get_rom_host_ptr(cpu, region, phys_addr));
+		}
+
+		set_last_error(lc86_status::invalid_parameter);
+		return nullptr;
+	}
+	catch (host_exp_t type) {
+		assert((type == host_exp_t::pf_exp) || (type == host_exp_t::de_exp));
+		set_last_error(lc86_status::guest_exp);
+		return nullptr;
+	}
+}
+
+/*
+* mem_init_region_ram -> creates a ram region. Only call this before cpu_run
+* cpu: a valid cpu instance
+* start: the guest physical address where the ram starts. Must be 4k aligned
+* size: size in bytes of ram. Must be a multiple of 4096
+* priority: the priority of the region. Overlapping higher prority regions will take precedence over regions with lower priority
+* ret: the status of the operation
+*/
 lc86_status
 mem_init_region_ram(cpu_t *cpu, addr_t start, size_t size, int priority)
 {
@@ -241,11 +311,21 @@ mem_init_region_ram(cpu_t *cpu, addr_t start, size_t size, int priority)
 	}
 }
 
+/*
+* mem_init_region_io -> creates an mmio or pmio region. Only call this before cpu_run
+* cpu: a valid cpu instance
+* start: where the region starts. A 4K aligned guest physical address for mmio, and a 4 byte aligned port for pmio
+* size: size of the region. For mmio, it must be a multiple of 4096, while for pmio, it must be a multiple of 4
+* io_space: true for pmio, and false for mmio
+* read_func: the function to call when this region is read from the guest
+* write_func: the function to call when this region is written to from the guest
+* opaque: an arbitrary host pointer which is passed to the registered r/w function for the region
+* priority: the priority of the region. Overlapping higher prority regions will take precedence over regions with lower priority
+* ret: the status of the operation
+*/
 lc86_status
 mem_init_region_io(cpu_t *cpu, addr_t start, size_t size, bool io_space, fp_read read_func, fp_write write_func, void *opaque, int priority)
 {
-	bool inserted;
-
 	if (size == 0) {
 		return set_last_error(lc86_status::invalid_parameter);
 	}
@@ -253,7 +333,15 @@ mem_init_region_io(cpu_t *cpu, addr_t start, size_t size, bool io_space, fp_read
 	if (io_space) {
 		std::unique_ptr<memory_region_t<port_t>> io(new memory_region_t<port_t>);
 
-		if (start > 65535 || (start + size) > 65536) {
+		if (cpu->num_io_regions == ((IO_MAX_PORT / IO_SIZE) - 1)) {
+			return set_last_error(lc86_status::too_many);
+		}
+
+		if (start > (IO_MAX_PORT - 1) || (start + size) > IO_MAX_PORT) {
+			return set_last_error(lc86_status::invalid_parameter);
+		}
+
+		if ((start % IO_SIZE) != 0 || ((size % IO_SIZE) != 0)) {
 			return set_last_error(lc86_status::invalid_parameter);
 		}
 
@@ -287,10 +375,22 @@ mem_init_region_io(cpu_t *cpu, addr_t start, size_t size, bool io_space, fp_read
 			io->opaque = opaque;
 		}
 
-		inserted = cpu->io_space_tree->insert(start_io, end, std::move(io));
+		if (cpu->io_space_tree->insert(start_io, end, std::move(io))) {
+			cpu->num_io_regions++;
+			return lc86_status::success;
+		}
 	}
 	else {
-		std::unique_ptr<memory_region_t<addr_t>> io(new memory_region_t<addr_t>);
+		std::unique_ptr<memory_region_t<addr_t>> mmio(new memory_region_t<addr_t>);
+
+		if ((start % PAGE_SIZE) != 0 || ((size % PAGE_SIZE) != 0)) {
+			return set_last_error(lc86_status::invalid_parameter);
+		}
+
+		if (cpu->num_mmio_regions == MMIO_MAX_NUM) {
+			return set_last_error(lc86_status::too_many);
+		}
+
 		addr_t end = start + size - 1;
 		cpu->memory_space_tree->search(start, end, cpu->memory_out);
 
@@ -300,38 +400,44 @@ mem_init_region_io(cpu_t *cpu, addr_t start, size_t size, bool io_space, fp_read
 			}
 		}
 
-		io->start = start;
-		io->end = end;
-		io->type = mem_type::mmio;
-		io->priority = priority;
+		mmio->start = start;
+		mmio->end = end;
+		mmio->type = mem_type::mmio;
+		mmio->priority = priority;
 		if (read_func) {
-			io->read_handler = read_func;
+			mmio->read_handler = read_func;
 		}
 		else {
-			io->read_handler = default_mmio_read_handler;
+			mmio->read_handler = default_mmio_read_handler;
 		}
 		if (write_func) {
-			io->write_handler = write_func;
+			mmio->write_handler = write_func;
 		}
 		else {
-			io->write_handler = default_mmio_write_handler;
+			mmio->write_handler = default_mmio_write_handler;
 		}
 		if (opaque) {
-			io->opaque = opaque;
+			mmio->opaque = opaque;
 		}
 
-		inserted = cpu->memory_space_tree->insert(start, end, std::move(io));
+		if (cpu->memory_space_tree->insert(start, end, std::move(mmio))) {
+			cpu->num_mmio_regions++;
+			return lc86_status::success;
+		}
 	}
 
-	if (inserted) {
-		return lc86_status::success;
-	}
-	else {
-		return set_last_error(lc86_status::invalid_parameter);
-	}
+	return set_last_error(lc86_status::invalid_parameter);
 }
 
-// XXX Are aliased regions allowed in the io space as well?
+/*
+* mem_init_region_alias -> creates a region that points to another region (which must not be pmio). Only call this before cpu_run
+* cpu: a valid cpu instance
+* alias_start: the guest physical address where the alias starts. Must be 4k aligned
+* ori_start: the guest physical address where the original region starts. Must be 4k aligned
+* ori_size: size in bytes of alias. Must be a multiple of 4096
+* priority: the priority of the region. Overlapping higher prority regions will take precedence over regions with lower priority
+* ret: the status of the operation
+*/
 lc86_status
 mem_init_region_alias(cpu_t *cpu, addr_t alias_start, addr_t ori_start, size_t ori_size, int priority)
 {
@@ -341,18 +447,20 @@ mem_init_region_alias(cpu_t *cpu, addr_t alias_start, addr_t ori_start, size_t o
 		return set_last_error(lc86_status::invalid_parameter);
 	}
 
+	if ((alias_start % PAGE_SIZE) != 0 || (ori_start % PAGE_SIZE) != 0 || ((ori_size % PAGE_SIZE) != 0)) {
+		return set_last_error(lc86_status::invalid_parameter);
+	}
+
 	memory_region_t<addr_t> *aliased_region = nullptr;
 	addr_t end = ori_start + ori_size - 1;
 	cpu->memory_space_tree->search(ori_start, end, cpu->memory_out);
 
-	if (cpu->memory_out.empty()) {
-		return set_last_error(lc86_status::invalid_parameter);
-	}
-
 	for (auto &region : cpu->memory_out) {
 		if ((region.get()->start <= ori_start) && (region.get()->end >= end)) {
-			aliased_region = region.get().get();
-			break;
+			if (region.get()->type != mem_type::unmapped) {
+				aliased_region = region.get().get();
+				break;
+			}
 		}
 	}
 
@@ -384,45 +492,30 @@ mem_init_region_alias(cpu_t *cpu, addr_t alias_start, addr_t ori_start, size_t o
 	}
 }
 
+/*
+* mem_init_region_rom -> creates a rom region. Only call this before cpu_run
+* cpu: a valid cpu instance
+* start: the guest physical address where the rom starts. Must be 4k aligned
+* size: size in bytes of rom. Must be a multiple of 4096
+* priority: the priority of the region. Overlapping higher prority regions will take precedence over regions with lower priority
+* buffer: a buffer that holds the rom that the region refers to
+* ret: the status of the operation
+*/
 lc86_status
-mem_init_region_rom(cpu_t *cpu, addr_t start, size_t size, uint32_t offset, int priority, const char *rom_path, uint8_t *&out)
+mem_init_region_rom(cpu_t *cpu, addr_t start, size_t size, int priority, std::unique_ptr<uint8_t[]> buffer)
 {
 	std::unique_ptr<memory_region_t<addr_t>> rom(new memory_region_t<addr_t>);
 
-	if (out == nullptr) {
-		std::ifstream ifs(rom_path, std::ios_base::in | std::ios_base::binary);
-		if (!ifs.is_open()) {
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		ifs.seekg(0, ifs.end);
-		size_t length = ifs.tellg();
-		ifs.seekg(0, ifs.beg);
-
-		if (length == 0) {
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		else if (offset + size > length) {
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-
-		std::unique_ptr<uint8_t[]> rom_ptr(new uint8_t[size]);
-		ifs.seekg(offset);
-		ifs.read(reinterpret_cast<char *>(&rom_ptr[0]), size);
-		ifs.close();
-		cpu->vec_rom.push_back(std::make_pair(std::move(rom_ptr), 0));
-		rom->rom_idx = cpu->vec_rom.size() - 1;
+	if (!buffer) {
+		return set_last_error(lc86_status::invalid_parameter);
 	}
-	else {
-		for (int i = 0; i < cpu->vec_rom.size(); i++) {
-			if (cpu->vec_rom[i].first.get() == out) {
-				rom->rom_idx = i;
-				break;
-			}
-		}
 
-		if (rom->rom_idx == -1) {
-			return set_last_error(lc86_status::invalid_parameter);
-		}
+	if ((start % PAGE_SIZE) != 0 || ((size % PAGE_SIZE) != 0)) {
+		return set_last_error(lc86_status::invalid_parameter);
+	}
+
+	if (cpu->num_rom_regions == ROM_MAX_NUM) {
+		return set_last_error(lc86_status::too_many);
 	}
 
 	addr_t end = start + size - 1;
@@ -430,9 +523,6 @@ mem_init_region_rom(cpu_t *cpu, addr_t start, size_t size, uint32_t offset, int 
 
 	for (auto &region : cpu->memory_out) {
 		if (region.get()->priority == priority) {
-			if (out == nullptr) {
-				cpu->vec_rom.pop_back();
-			}
 			return set_last_error(lc86_status::invalid_parameter);
 		}
 	}
@@ -441,59 +531,11 @@ mem_init_region_rom(cpu_t *cpu, addr_t start, size_t size, uint32_t offset, int 
 	rom->end = end;
 	rom->type = mem_type::rom;
 	rom->priority = priority;
+	rom->rom_idx = cpu->vec_rom.size();
 
-	auto &rom_ref = cpu->vec_rom[rom->rom_idx];
 	if (cpu->memory_space_tree->insert(start, end, std::move(rom))) {
-		out = rom_ref.first.get();
-		rom_ref.second++;
-		return lc86_status::success;
-	}
-
-	if (out == nullptr) {
-		cpu->vec_rom.pop_back();
-	}
-	return set_last_error(lc86_status::invalid_parameter);
-}
-
-lc86_status
-mem_destroy_region(cpu_t *cpu, addr_t start, size_t size, bool io_space)
-{
-	bool deleted;
-	int rom_idx = -1;
-
-	if (io_space) {
-		port_t start_io = static_cast<port_t>(start);
-		port_t end = start + size - 1;
-		deleted = cpu->io_space_tree->erase(start_io, end);
-	}
-	else {
-		bool found = false;
-		addr_t end = start + size - 1;
-		cpu->memory_space_tree->search(start, end, cpu->memory_out);
-		for (auto &region : cpu->memory_out) {
-			if ((region.get().get()->start == start) && (region.get().get()->end == end)) {
-				if (region.get().get()->type == mem_type::rom) {
-					rom_idx = region.get().get()->rom_idx;
-				}
-				found = true;
-				break;
-			}
-		}
-
-		if (!found) {
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-
-		deleted = cpu->memory_space_tree->erase(start, end);
-	}
-
-	if (deleted) {
-		if (rom_idx != -1) {
-			cpu->vec_rom[rom_idx].second--;
-			if (cpu->vec_rom[rom_idx].second == 0) {
-				cpu->vec_rom.erase(cpu->vec_rom.begin() + rom_idx);
-			}
-		}
+		cpu->vec_rom.push_back(std::move(buffer));
+		cpu->num_rom_regions++;
 		return lc86_status::success;
 	}
 	else {
@@ -501,8 +543,91 @@ mem_destroy_region(cpu_t *cpu, addr_t start, size_t size, bool io_space)
 	}
 }
 
+/*
+* mem_destroy_region -> destroys a region. At the moemnt, this is only safe for pmio, mmio, alias and rom
+* cpu: a valid cpu instance
+* start: the guest physical address where the region starts
+* size: size in bytes of region
+* io_space: true for pmio, and false for mmio
+* ret: the status of the operation
+*/
 lc86_status
-mem_read_block(cpu_t *cpu, addr_t addr, size_t size, uint8_t *out)
+mem_destroy_region(cpu_t *cpu, addr_t start, size_t size, bool io_space)
+{
+	if (io_space) {
+		port_t start_io = static_cast<port_t>(start);
+		port_t end_io = start + size - 1;
+		cpu->io_space_tree->search(start_io, end_io, cpu->io_out);
+		const auto region = cpu->io_out.begin()->get().get();
+		if ((region->type == mem_type::pmio) && (region->start == start_io) && (region->end == end_io)) {
+			// if the above conditions are satisfied, then the erase below is going to succeed, so we can flush the iotlb and avoid needless flushes
+			iotlb_flush(cpu, region);
+			[[maybe_unused]] bool deleted = cpu->io_space_tree->erase(start_io, end_io);
+			assert(deleted);
+			cpu->num_io_regions--;
+			return lc86_status::success;
+		}
+
+		return set_last_error(lc86_status::invalid_parameter);
+	}
+	else {
+		addr_t end = start + size - 1;
+		cpu->memory_space_tree->search(start, end, cpu->memory_out);
+		auto region = cpu->memory_out.begin()->get().get();
+
+		if (region->type == mem_type::alias) {
+			AS_RESOLVE_ALIAS();
+		}
+
+		if (region->type == mem_type::rom) {
+			if ((region->start == start) && (region->end == end)) {
+				// if the above conditions are satisfied, then the erase below is going to succeed, so we can flush the tlb and avoid needless flushes
+				// we must also flush the code cache because code can exist in a rom region
+				rom_flush_cached(cpu, region);
+				cpu->vec_rom.erase(cpu->vec_rom.begin() + region->rom_idx);
+				tc_cache_clear(cpu);
+				[[maybe_unused]] bool deleted = cpu->memory_space_tree->erase(start, end);
+				assert(deleted);
+				cpu->num_rom_regions--;
+				return lc86_status::success;
+			}
+			else {
+				return set_last_error(lc86_status::invalid_parameter);
+			}
+		}
+		else if (region->type == mem_type::mmio) {
+			if ((region->start == start) && (region->end == end)) {
+				// if the above conditions are satisfied, then the erase below is going to succeed, so we can flush the tlb and avoid needless flushes
+				mmio_flush_cached(cpu, region);
+				[[maybe_unused]] bool deleted = cpu->memory_space_tree->erase(start, end);
+				assert(deleted);
+				cpu->num_mmio_regions--;
+				return lc86_status::success;
+			}
+			else {
+				return set_last_error(lc86_status::invalid_parameter);
+			}
+		}
+		else if (cpu->memory_space_tree->erase(start, end)) {
+			return lc86_status::success;
+		}
+		else {
+			return set_last_error(lc86_status::invalid_parameter);
+		}
+	}
+}
+
+/*
+* mem_read_block -> reads a block of memory from ram/rom. Only call this from an mmio/pmio/hook callback
+* cpu: a valid cpu instance
+* addr: the guest virtual address to read from
+* size: number of bytes to read
+* out: pointer where the read contents are stored to
+* actual_size: number of bytes actually read
+* ret: the status of the operation
+*/
+lc86_status
+mem_read_block(cpu_t *cpu, addr_t addr, size_t size, uint8_t *out, size_t *actual_size)
 {
 	size_t vec_offset = 0;
 	size_t page_offset = addr & PAGE_MASK;
@@ -526,9 +651,6 @@ mem_read_block(cpu_t *cpu, addr_t addr, size_t size, uint8_t *out)
 					std::memcpy(out + vec_offset, get_rom_host_ptr(cpu, region, phys_addr), bytes_to_read);
 					break;
 
-				case mem_type::mmio:
-					return set_last_error(lc86_status::invalid_parameter);
-
 				case mem_type::alias: {
 					memory_region_t<addr_t> *alias = region;
 					AS_RESOLVE_ALIAS();
@@ -537,18 +659,20 @@ mem_read_block(cpu_t *cpu, addr_t addr, size_t size, uint8_t *out)
 				}
 				break;
 
+				case mem_type::mmio:
 				case mem_type::unmapped:
-					LOG(log_level::warn, "Memory read to unmapped memory at address %#010x with size %zu", phys_addr, bytes_to_read);
-					std::memcpy(out + vec_offset, std::vector<uint8_t>(bytes_to_read, 0xFF).data(), bytes_to_read);
-					break;
-
 				default:
+					if (actual_size) {
+						*actual_size = vec_offset;
+					}
 					return set_last_error(lc86_status::internal_error);
 				}
 			}
 			else {
-				LOG(log_level::warn, "Memory read at address %#010x with size %zu is not completely inside a memory region", phys_addr, bytes_to_read);
-				std::memcpy(out + vec_offset, std::vector<uint8_t>(bytes_to_read, 0xFF).data(), bytes_to_read);
+				if (actual_size) {
+					*actual_size = vec_offset;
+				}
+				return set_last_error(lc86_status::internal_error);
 			}
 
 			page_offset = 0;
@@ -557,19 +681,24 @@ mem_read_block(cpu_t *cpu, addr_t addr, size_t size, uint8_t *out)
 			addr += bytes_to_read;
 		}
 
+		if (actual_size) {
+			*actual_size = vec_offset;
+		}
 		return lc86_status::success;
 	}
 	catch (host_exp_t type) {
 		assert((type == host_exp_t::pf_exp) || (type == host_exp_t::de_exp));
+		if (actual_size) {
+			*actual_size = vec_offset;
+		}
 		return set_last_error(lc86_status::guest_exp);
 	}
 }
 
-// NOTE1: this is not correct if the client writes to the same tc we are executing (because we pass nullptr as tc argument to tc_invalidate)
-// NOTE2: if a page fault is raised on a page after the first one is written to, this will result in a partial write. I'm not sure if this is a problem though
 template<bool fill>
-lc86_status mem_write_handler(cpu_t *cpu, addr_t addr, size_t size, const void *buffer, int val)
+lc86_status mem_write_handler(cpu_t *cpu, addr_t addr, size_t size, const void *buffer, int val, size_t *actual_size)
 {
+	size_t size_tot = 0;
 	size_t page_offset = addr & PAGE_MASK;
 	size_t size_left = size;
 
@@ -579,7 +708,7 @@ lc86_status mem_write_handler(cpu_t *cpu, addr_t addr, size_t size, const void *
 			size_t bytes_to_write = std::min(PAGE_SIZE - page_offset, size_left);
 			addr_t phys_addr = get_write_addr(cpu, addr, 0, 0, &is_code);
 			if (is_code) {
-				tc_invalidate(&cpu->cpu_ctx, nullptr, phys_addr, bytes_to_write, 0);
+				tc_invalidate(&cpu->cpu_ctx, phys_addr, bytes_to_write, cpu->cpu_ctx.regs.eip);
 			}
 
 			memory_region_t<addr_t> *region = as_memory_search_addr<uint8_t>(cpu, phys_addr);
@@ -599,9 +728,6 @@ lc86_status mem_write_handler(cpu_t *cpu, addr_t addr, size_t size, const void *
 				case mem_type::rom:
 					break;
 
-				case mem_type::mmio:
-					return set_last_error(lc86_status::invalid_parameter);
-
 				case mem_type::alias: {
 					memory_region_t<addr_t> *alias = region;
 					AS_RESOLVE_ALIAS();
@@ -610,44 +736,79 @@ lc86_status mem_write_handler(cpu_t *cpu, addr_t addr, size_t size, const void *
 				}
 				break;
 
+				case mem_type::mmio:
 				case mem_type::unmapped:
-					LOG(log_level::warn, "Memory write to unmapped memory at address %#010x with size %zu", phys_addr, bytes_to_write);
-					break;
-
 				default:
+					if (actual_size) {
+						*actual_size = size_tot;
+					}
 					return set_last_error(lc86_status::internal_error);
 				}
 			}
 			else {
-				LOG(log_level::warn, "Memory write at address %#010x with size %zu is not completely inside a memory region", phys_addr, bytes_to_write);
+				if (actual_size) {
+					*actual_size = size_tot;
+				}
+				return set_last_error(lc86_status::internal_error);
 			}
 
 			page_offset = 0;
 			buffer = static_cast<const uint8_t *>(buffer) + bytes_to_write;
+			size_tot += bytes_to_write;
 			size_left -= bytes_to_write;
 			addr += bytes_to_write;
 		}
 
+		if (actual_size) {
+			*actual_size = size_tot;
+		}
 		return lc86_status::success;
 	}
 	catch (host_exp_t type) {
 		assert((type == host_exp_t::pf_exp) || (type == host_exp_t::de_exp));
+		if (actual_size) {
+			*actual_size = size_tot;
+		}
 		return set_last_error(lc86_status::guest_exp);
 	}
 }
 
+/*
+* mem_write_block -> writes a block of memory to ram/rom. Only call this from a hook
+* cpu: a valid cpu instance
+* addr: the guest virtual address to write to
+* size: number of bytes to write
+* buffer: pointer to a buffer that holds the bytes to write
+* actual_size: number of bytes actually written
+* ret: the status of the operation
+*/
 lc86_status
-mem_write_block(cpu_t *cpu, addr_t addr, size_t size, const void *buffer)
+mem_write_block(cpu_t *cpu, addr_t addr, size_t size, const void *buffer, size_t *actual_size)
 {
-	return mem_write_handler<false>(cpu, addr, size, buffer, 0);
+	return mem_write_handler<false>(cpu, addr, size, buffer, 0, actual_size);
 }
 
+/*
+* mem_fill_block -> fills ram/rom with a value. Only call this from an mmio/pmio/hook callback
+* cpu: a valid cpu instance
+* addr: the guest virtual address to write to
+* size: number of bytes to write
+* val: the value to write
+* actual_size: number of bytes actually written
+* ret: the status of the operation
+*/
 lc86_status
-mem_fill_block(cpu_t *cpu, addr_t addr, size_t size, int val)
+mem_fill_block(cpu_t *cpu, addr_t addr, size_t size, int val, size_t *actual_size)
 {
-	return mem_write_handler<true>(cpu, addr, size, nullptr, val);
+	return mem_write_handler<true>(cpu, addr, size, nullptr, val, actual_size);
 }
 
+/*
+* io_read_8/16/32 -> reads 8/16/32 bits from a pmio port. Only call this from an mmio/pmio/hook callback
+* cpu: a valid cpu instance
+* port: the port to read from
+* ret: the read value
+*/
 uint8_t
 io_read_8(cpu_t *cpu, port_t port)
 {
@@ -666,6 +827,13 @@ io_read_32(cpu_t *cpu, port_t port)
 	return io_read<uint32_t>(cpu, port);
 }
 
+/*
+* io_write_8/16/32 -> writes 8/16/32 bits to a pmio port. Only call this from an mmio/pmio/hook callback
+* cpu: a valid cpu instance
+* port: the port to write to
+* value: the value to write
+* ret: nothing
+*/
 void
 io_write_8(cpu_t *cpu, port_t port, uint8_t value)
 {
@@ -684,6 +852,13 @@ io_write_32(cpu_t *cpu, port_t port, uint32_t value)
 	io_write<uint32_t>(cpu, port, value);
 }
 
+/*
+* tlb_invalidate -> flushes tlb entries in the specified range. Only call this from an mmio/pmio/hook callback
+* cpu: a valid cpu instance
+* addr_start: a guest virtual address where the flush starts
+* addr_end: a guest virtual address where the flush end
+* ret: nothing
+*/
 void
 tlb_invalidate(cpu_t *cpu, addr_t addr_start, addr_t addr_end)
 {
@@ -692,14 +867,22 @@ tlb_invalidate(cpu_t *cpu, addr_t addr_start, addr_t addr_end)
 	}
 }
 
+/*
+* hook_add -> adds a hook to intercept a guest function and redirect it to a host function. Only call this from a hook
+* cpu: a valid cpu instance
+* addr: the virtual address of the first instruction of the guest function to intercept
+* obj: an object that holds additional data on the hook
+* ret: the status of the operation
+*/
 lc86_status
 hook_add(cpu_t *cpu, addr_t addr, std::unique_ptr<hook> obj)
 {
-	// NOTE: this hooks will only work as expected when they are added before cpu execution starts (becasue
-	// we don't flush the code cache here) and only when addr points to the first instruction of the hooked
-	// function (because we only check for hooks at the start of the translation of a new code block)
+	// adds a host function that is called in place of the original guest function when pc reaches addr. The client is responsible for fetching the guest arguments
+	// (if they need them) and fixing the guest stack/register before the host function returns
+	// NOTE: this hooks will only work when addr points to the first instruction of the hooked function (because we only check for hooks at the start
+	// of the translation of a new code block)
 
-	if (cpu->hook_map.find(addr) != cpu->hook_map.end()) {
+	if (cpu->hook_map.contains(addr)) {
 		return set_last_error(lc86_status::already_exist);
 	}
 
@@ -707,1126 +890,125 @@ hook_add(cpu_t *cpu, addr_t addr, std::unique_ptr<hook> obj)
 		return set_last_error(lc86_status::invalid_parameter);
 	}
 
-	if (obj->info.args.size() == 0) {
+	if (obj->args_t.size() != obj->args_val.size()) {
 		return set_last_error(lc86_status::invalid_parameter);
 	}
 
-	if (obj->info.args.size() > 1) {
-		for (unsigned i = 1; i < obj->info.args.size(); i++) {
-			if (obj->info.args[i] == arg_types::void_) {
-				return set_last_error(lc86_status::invalid_parameter);
-			}
-		}
-	}
-
-	obj->trmp_vec.clear();
 	cpu->hook_map.emplace(addr, std::move(obj));
+
+	try {
+		uint8_t is_code;
+		volatile addr_t phys_addr = get_write_addr(cpu, addr, 2, cpu->cpu_ctx.regs.eip, &is_code);
+		tc_invalidate(&cpu->cpu_ctx, addr, 1, cpu->cpu_ctx.regs.eip);
+	}
+	catch (host_exp_t type) {
+		return set_last_error(lc86_status::guest_exp);
+	}
 
 	return lc86_status::success;
 }
 
+/*
+* hook_remove -> removes a hook. Only call this from a hook. If called from the same hook which is being removed, it won't return and it will throw an exception instead
+* cpu: a valid cpu instance
+* addr: the virtual address of the first instruction of the guest function to intercept
+* ret: the status of the operation
+*/
 lc86_status
-trampoline_call(cpu_t *cpu, addr_t addr, std::any &ret, std::vector<std::any> args)
+hook_remove(cpu_t *cpu, addr_t addr)
 {
-	auto it = cpu->hook_map.find(addr);
+	const auto it = cpu->hook_map.find(addr);
 	if (it == cpu->hook_map.end()) {
 		return set_last_error(lc86_status::not_found);
 	}
 
-	return cpu_exec_trampoline(cpu, addr, it->second.get(), ret, args);
-}
-
-lc86_status
-read_gpr(cpu_t *cpu, uint32_t *value, int reg, int size_or_sel)
-{
-	switch (reg)
-	{
-	case REG_EAX:
-		switch (size_or_sel)
-		{
-		case REG32:
-			*value = cpu->cpu_ctx.regs.eax;
-			break;
-
-		case REG16:
-			*value = (cpu->cpu_ctx.regs.eax & 0xFFFF);
-			break;
-
-		case REG8H:
-			*value = ((cpu->cpu_ctx.regs.eax & 0xFF00) >> 8);
-			break;
-
-		case REG8L:
-			*value = (cpu->cpu_ctx.regs.eax & 0xFF);
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_ECX:
-		switch (size_or_sel)
-		{
-		case REG32:
-			*value = cpu->cpu_ctx.regs.ecx;
-			break;
-
-		case REG16:
-			*value = (cpu->cpu_ctx.regs.ecx & 0xFFFF);
-			break;
-
-		case REG8H:
-			*value = ((cpu->cpu_ctx.regs.ecx & 0xFF00) >> 8);
-			break;
-
-		case REG8L:
-			*value = (cpu->cpu_ctx.regs.ecx & 0xFF);
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_EDX:
-		switch (size_or_sel)
-		{
-		case REG32:
-			*value = cpu->cpu_ctx.regs.edx;
-			break;
-
-		case REG16:
-			*value = (cpu->cpu_ctx.regs.edx & 0xFFFF);
-			break;
-
-		case REG8H:
-			*value = ((cpu->cpu_ctx.regs.edx & 0xFF00) >> 8);
-			break;
-
-		case REG8L:
-			*value = (cpu->cpu_ctx.regs.edx & 0xFF);
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_EBX:
-		switch (size_or_sel)
-		{
-		case REG32:
-			*value = cpu->cpu_ctx.regs.ebx;
-			break;
-
-		case REG16:
-			*value = (cpu->cpu_ctx.regs.ebx & 0xFFFF);
-			break;
-
-		case REG8H:
-			*value = ((cpu->cpu_ctx.regs.ebx & 0xFF00) >> 8);
-			break;
-
-		case REG8L:
-			*value = (cpu->cpu_ctx.regs.ebx & 0xFF);
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_ESP:
-		switch (size_or_sel)
-		{
-		case REG32:
-			*value = cpu->cpu_ctx.regs.esp;
-			break;
-
-		case REG16:
-			*value = (cpu->cpu_ctx.regs.esp & 0xFFFF);
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_EBP:
-		switch (size_or_sel)
-		{
-		case REG32:
-			*value = cpu->cpu_ctx.regs.ebp;
-			break;
-
-		case REG16:
-			*value = (cpu->cpu_ctx.regs.ebp & 0xFFFF);
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_ESI:
-		switch (size_or_sel)
-		{
-		case REG32:
-			*value = cpu->cpu_ctx.regs.esi;
-			break;
-
-		case REG16:
-			*value = (cpu->cpu_ctx.regs.esi & 0xFFFF);
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_EDI:
-		switch (size_or_sel)
-		{
-		case REG32:
-			*value = cpu->cpu_ctx.regs.edi;
-			break;
-
-		case REG16:
-			*value = (cpu->cpu_ctx.regs.edi & 0xFFFF);
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_ES:
-		switch (size_or_sel)
-		{
-		case SEG_SEL:
-			*value = cpu->cpu_ctx.regs.es;
-			break;
-
-		case SEG_BASE:
-			*value = cpu->cpu_ctx.regs.es_hidden.base;
-			break;
-
-		case SEG_LIMIT:
-			*value = cpu->cpu_ctx.regs.es_hidden.limit;
-			break;
-
-		case SEG_FLG:
-			*value = cpu->cpu_ctx.regs.es_hidden.flags;
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_CS:
-		switch (size_or_sel)
-		{
-		case SEG_SEL:
-			*value = cpu->cpu_ctx.regs.cs;
-			break;
-
-		case SEG_BASE:
-			*value = cpu->cpu_ctx.regs.cs_hidden.base;
-			break;
-
-		case SEG_LIMIT:
-			*value = cpu->cpu_ctx.regs.cs_hidden.limit;
-			break;
-
-		case SEG_FLG:
-			*value = cpu->cpu_ctx.regs.cs_hidden.flags;
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_SS:
-		switch (size_or_sel)
-		{
-		case SEG_SEL:
-			*value = cpu->cpu_ctx.regs.ss;
-			break;
-
-		case SEG_BASE:
-			*value = cpu->cpu_ctx.regs.ss_hidden.base;
-			break;
-
-		case SEG_LIMIT:
-			*value = cpu->cpu_ctx.regs.ss_hidden.limit;
-			break;
-
-		case SEG_FLG:
-			*value = cpu->cpu_ctx.regs.ss_hidden.flags;
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_DS:
-		switch (size_or_sel)
-		{
-		case SEG_SEL:
-			*value = cpu->cpu_ctx.regs.ds;
-			break;
-
-		case SEG_BASE:
-			*value = cpu->cpu_ctx.regs.ds_hidden.base;
-			break;
-
-		case SEG_LIMIT:
-			*value = cpu->cpu_ctx.regs.ds_hidden.limit;
-			break;
-
-		case SEG_FLG:
-			*value = cpu->cpu_ctx.regs.ds_hidden.flags;
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_FS:
-		switch (size_or_sel)
-		{
-		case SEG_SEL:
-			*value = cpu->cpu_ctx.regs.fs;
-			break;
-
-		case SEG_BASE:
-			*value = cpu->cpu_ctx.regs.fs_hidden.base;
-			break;
-
-		case SEG_LIMIT:
-			*value = cpu->cpu_ctx.regs.fs_hidden.limit;
-			break;
-
-		case SEG_FLG:
-			*value = cpu->cpu_ctx.regs.fs_hidden.flags;
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_GS:
-		switch (size_or_sel)
-		{
-		case SEG_SEL:
-			*value = cpu->cpu_ctx.regs.gs;
-			break;
-
-		case SEG_BASE:
-			*value = cpu->cpu_ctx.regs.gs_hidden.base;
-			break;
-
-		case SEG_LIMIT:
-			*value = cpu->cpu_ctx.regs.gs_hidden.limit;
-			break;
-
-		case SEG_FLG:
-			*value = cpu->cpu_ctx.regs.gs_hidden.flags;
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_CR0:
-		*value = cpu->cpu_ctx.regs.cr0;
-		break;
-
-	case REG_CR1:
-		*value = cpu->cpu_ctx.regs.cr1;
-		break;
-
-	case REG_CR2:
-		*value = cpu->cpu_ctx.regs.cr2;
-		break;
-
-	case REG_CR3:
-		*value = cpu->cpu_ctx.regs.cr3;
-		break;
-
-	case REG_CR4:
-		*value = cpu->cpu_ctx.regs.cr4;
-		break;
-
-	case REG_DR0:
-		*value = cpu->cpu_ctx.regs.dr0;
-		break;
-
-	case REG_DR1:
-		*value = cpu->cpu_ctx.regs.dr1;
-		break;
-
-	case REG_DR2:
-		*value = cpu->cpu_ctx.regs.dr2;
-		break;
-
-	case REG_DR3:
-		*value = cpu->cpu_ctx.regs.dr3;
-		break;
-
-	case REG_DR4:
-		*value = cpu->cpu_ctx.regs.dr4;
-		break;
-
-	case REG_DR5:
-		*value = cpu->cpu_ctx.regs.dr5;
-		break;
-
-	case REG_DR6:
-		*value = cpu->cpu_ctx.regs.dr6;
-		break;
-
-	case REG_DR7:
-		*value = cpu->cpu_ctx.regs.dr7;
-		break;
-
-	case REG_EFLAGS: {
-		uint32_t arth_flags = (((cpu->cpu_ctx.lazy_eflags.auxbits & 0x80000000) >> 31) | // cf
-			(((cpu->cpu_ctx.lazy_eflags.parity[(cpu->cpu_ctx.lazy_eflags.result ^ (cpu->cpu_ctx.lazy_eflags.auxbits >> 8)) & 0xFF]) ^ 1) << 2) | // pf
-			((cpu->cpu_ctx.lazy_eflags.auxbits & 8) << 1) | // af
-			(((((cpu->cpu_ctx.lazy_eflags.result | -cpu->cpu_ctx.lazy_eflags.result) >> 31) & 1) ^ 1) << 6) | // zf
-			(((cpu->cpu_ctx.lazy_eflags.result >> 31) ^ (cpu->cpu_ctx.lazy_eflags.auxbits & 1)) << 7) | // sf
-			(((cpu->cpu_ctx.lazy_eflags.auxbits ^ (cpu->cpu_ctx.lazy_eflags.auxbits << 1)) & 0x80000000) >> 20) // of
-			);
-		switch (size_or_sel)
-		{
-		case REG32:
-			*value = (cpu->cpu_ctx.regs.eflags | arth_flags);
-			break;
-
-		case REG16:
-			*value = ((cpu->cpu_ctx.regs.eflags & 0xFFFF) | arth_flags);
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
+	try {
+		uint8_t is_code;
+		volatile addr_t phys_addr = get_write_addr(cpu, addr, 2, cpu->cpu_ctx.regs.eip, &is_code);
+		cpu->hook_map.erase(it);
+		tc_invalidate<true>(&cpu->cpu_ctx, addr);
 	}
-	break;
-
-	case REG_EIP:
-		switch (size_or_sel)
-		{
-		case REG32:
-			*value = cpu->cpu_ctx.regs.eip;
-			break;
-
-		case REG16:
-			*value = (cpu->cpu_ctx.regs.eip & 0xFFFF);
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_IDTR:
-		switch (size_or_sel)
-		{
-		case SEG_BASE:
-			*value = cpu->cpu_ctx.regs.idtr_hidden.base;
-			break;
-
-		case SEG_LIMIT:
-			*value = cpu->cpu_ctx.regs.idtr_hidden.limit;
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_GDTR:
-		switch (size_or_sel)
-		{
-		case SEG_BASE:
-			*value = cpu->cpu_ctx.regs.gdtr_hidden.base;
-			break;
-
-		case SEG_LIMIT:
-			*value = cpu->cpu_ctx.regs.gdtr_hidden.limit;
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_LDTR:
-		switch (size_or_sel)
-		{
-		case SEG_SEL:
-			*value = cpu->cpu_ctx.regs.ldtr;
-			break;
-
-		case SEG_BASE:
-			*value = cpu->cpu_ctx.regs.ldtr_hidden.base;
-			break;
-
-		case SEG_LIMIT:
-			*value = cpu->cpu_ctx.regs.ldtr_hidden.limit;
-			break;
-
-		case SEG_FLG:
-			*value = cpu->cpu_ctx.regs.ldtr_hidden.flags;
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_TR:
-		switch (size_or_sel)
-		{
-		case SEG_SEL:
-			*value = cpu->cpu_ctx.regs.tr;
-			break;
-
-		case SEG_BASE:
-			*value = cpu->cpu_ctx.regs.tr_hidden.base;
-			break;
-
-		case SEG_LIMIT:
-			*value = cpu->cpu_ctx.regs.tr_hidden.limit;
-			break;
-
-		case SEG_FLG:
-			*value = cpu->cpu_ctx.regs.tr_hidden.flags;
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
+	catch (host_exp_t type) {
+		return set_last_error(lc86_status::guest_exp);
 	}
 
 	return lc86_status::success;
 }
 
-lc86_status
-write_gpr(cpu_t *cpu, uint32_t value, int reg, int size_or_sel)
+/*
+* trampoline_call -> calls the original intercepted guest function. Only call this from a hook
+* cpu: a valid cpu instance
+* ret_eip: the virtual address to which the original guest function returns to after if finishes execution
+* ret: nothing
+*/
+void
+trampoline_call(cpu_t *cpu, const uint32_t ret_eip)
 {
-	switch (reg)
-	{
-	case REG_EAX:
-		switch (size_or_sel)
-		{
-		case REG32:
-			cpu->cpu_ctx.regs.eax = value;
-			break;
-
-		case REG16:
-			(cpu->cpu_ctx.regs.eax &= 0xFFFF0000) |= (value & 0xFFFF);
-			break;
-
-		case REG8H:
-			(cpu->cpu_ctx.regs.eax &= 0xFFFF00FF) |= ((value & 0xFF) << 8);
-			break;
-
-		case REG8L:
-			(cpu->cpu_ctx.regs.eax &= 0xFFFFFF00) |= (value & 0xFF);
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_ECX:
-		switch (size_or_sel)
-		{
-		case REG32:
-			cpu->cpu_ctx.regs.ecx = value;
-			break;
-
-		case REG16:
-			(cpu->cpu_ctx.regs.ecx &= 0xFFFF0000) |= (value & 0xFFFF);
-			break;
-
-		case REG8H:
-			(cpu->cpu_ctx.regs.ecx &= 0xFFFF00FF) |= ((value & 0xFF) << 8);
-			break;
-
-		case REG8L:
-			(cpu->cpu_ctx.regs.ecx &= 0xFFFFFF00) |= (value & 0xFF);
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_EDX:
-		switch (size_or_sel)
-		{
-		case REG32:
-			cpu->cpu_ctx.regs.edx = value;
-			break;
-
-		case REG16:
-			(cpu->cpu_ctx.regs.edx &= 0xFFFF0000) |= (value & 0xFFFF);
-			break;
-
-		case REG8H:
-			(cpu->cpu_ctx.regs.edx &= 0xFFFF00FF) |= ((value & 0xFF) << 8);
-			break;
-
-		case REG8L:
-			(cpu->cpu_ctx.regs.edx &= 0xFFFFFF00) |= (value & 0xFF);
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_EBX:
-		switch (size_or_sel)
-		{
-		case REG32:
-			cpu->cpu_ctx.regs.ebx = value;
-			break;
-
-		case REG16:
-			(cpu->cpu_ctx.regs.ebx &= 0xFFFF0000) |= (value & 0xFFFF);
-			break;
-
-		case REG8H:
-			(cpu->cpu_ctx.regs.ebx &= 0xFFFF00FF) |= ((value & 0xFF) << 8);
-			break;
-
-		case REG8L:
-			(cpu->cpu_ctx.regs.ebx &= 0xFFFFFF00) |= (value & 0xFF);
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_ESP:
-		switch (size_or_sel)
-		{
-		case REG32:
-			cpu->cpu_ctx.regs.esp = value;
-			break;
-
-		case REG16:
-			(cpu->cpu_ctx.regs.esp &= 0xFFFF0000) |= (value & 0xFFFF);
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_EBP:
-		switch (size_or_sel)
-		{
-		case REG32:
-			cpu->cpu_ctx.regs.ebp = value;
-			break;
-
-		case REG16:
-			(cpu->cpu_ctx.regs.ebp &= 0xFFFF0000) |= (value & 0xFFFF);
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_ESI:
-		switch (size_or_sel)
-		{
-		case REG32:
-			cpu->cpu_ctx.regs.esi = value;
-			break;
-
-		case REG16:
-			(cpu->cpu_ctx.regs.esi &= 0xFFFF0000) |= (value & 0xFFFF);
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_EDI:
-		switch (size_or_sel)
-		{
-		case REG32:
-			cpu->cpu_ctx.regs.edi = value;
-			break;
-
-		case REG16:
-			(cpu->cpu_ctx.regs.edi &= 0xFFFF0000) |= (value & 0xFFFF);
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_ES:
-		switch (size_or_sel)
-		{
-		case SEG_SEL:
-			cpu->cpu_ctx.regs.es = (value & 0xFFFF);
-			break;
-
-		case SEG_BASE:
-			cpu->cpu_ctx.regs.es_hidden.base = value;
-			break;
-
-		case SEG_LIMIT:
-			cpu->cpu_ctx.regs.es_hidden.limit = value;
-			break;
-
-		case SEG_FLG:
-			cpu->cpu_ctx.regs.es_hidden.flags = value;
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_CS:
-		switch (size_or_sel)
-		{
-		case SEG_SEL:
-			cpu->cpu_ctx.regs.cs = (value & 0xFFFF);
-			break;
-
-		case SEG_BASE:
-			cpu->cpu_ctx.regs.cs_hidden.base = value;
-			break;
-
-		case SEG_LIMIT:
-			cpu->cpu_ctx.regs.cs_hidden.limit = value;
-			break;
-
-		case SEG_FLG:
-			cpu->cpu_ctx.regs.cs_hidden.flags = value;
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_SS:
-		switch (size_or_sel)
-		{
-		case SEG_SEL:
-			cpu->cpu_ctx.regs.ss = (value & 0xFFFF);
-			break;
-
-		case SEG_BASE:
-			cpu->cpu_ctx.regs.ss_hidden.base = value;
-			break;
-
-		case SEG_LIMIT:
-			cpu->cpu_ctx.regs.ss_hidden.limit = value;
-			break;
-
-		case SEG_FLG:
-			cpu->cpu_ctx.regs.ss_hidden.flags = value;
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_DS:
-		switch (size_or_sel)
-		{
-		case SEG_SEL:
-			cpu->cpu_ctx.regs.ds = (value & 0xFFFF);
-			break;
-
-		case SEG_BASE:
-			cpu->cpu_ctx.regs.ds_hidden.base = value;
-			break;
-
-		case SEG_LIMIT:
-			cpu->cpu_ctx.regs.ds_hidden.limit = value;
-			break;
-
-		case SEG_FLG:
-			cpu->cpu_ctx.regs.ds_hidden.flags = value;
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_FS:
-		switch (size_or_sel)
-		{
-		case SEG_SEL:
-			cpu->cpu_ctx.regs.fs = (value & 0xFFFF);
-			break;
-
-		case SEG_BASE:
-			cpu->cpu_ctx.regs.fs_hidden.base = value;
-			break;
-
-		case SEG_LIMIT:
-			cpu->cpu_ctx.regs.fs_hidden.limit = value;
-			break;
-
-		case SEG_FLG:
-			cpu->cpu_ctx.regs.fs_hidden.flags = value;
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_GS:
-		switch (size_or_sel)
-		{
-		case SEG_SEL:
-			cpu->cpu_ctx.regs.gs = (value & 0xFFFF);
-			break;
-
-		case SEG_BASE:
-			cpu->cpu_ctx.regs.gs_hidden.base = value;
-			break;
-
-		case SEG_LIMIT:
-			cpu->cpu_ctx.regs.gs_hidden.limit = value;
-			break;
-
-		case SEG_FLG:
-			cpu->cpu_ctx.regs.gs_hidden.flags = value;
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_CR0:
-		cpu->cpu_ctx.regs.cr0 = value;
-		break;
-
-	case REG_CR1:
-		cpu->cpu_ctx.regs.cr1 = value;
-		break;
-
-	case REG_CR2:
-		cpu->cpu_ctx.regs.cr2 = value;
-		break;
-
-	case REG_CR3:
-		cpu->cpu_ctx.regs.cr3 = value;
-		break;
-
-	case REG_CR4:
-		cpu->cpu_ctx.regs.cr4 = value;
-		break;
-
-	case REG_DR0:
-		cpu->cpu_ctx.regs.dr0 = value;
-		break;
-
-	case REG_DR1:
-		cpu->cpu_ctx.regs.dr1 = value;
-		break;
-
-	case REG_DR2:
-		cpu->cpu_ctx.regs.dr2 = value;
-		break;
-
-	case REG_DR3:
-		cpu->cpu_ctx.regs.dr3 = value;
-		break;
-
-	case REG_DR4:
-		cpu->cpu_ctx.regs.dr4 = value;
-		break;
-
-	case REG_DR5:
-		cpu->cpu_ctx.regs.dr5 = value;
-		break;
-
-	case REG_DR6:
-		cpu->cpu_ctx.regs.dr6 = value;
-		break;
-
-	case REG_DR7:
-		cpu->cpu_ctx.regs.dr7 = value;
-		break;
-
-	case REG_EFLAGS: {
-		uint32_t new_res, new_aux;
-		new_aux = (((value & 1) << 31) | // cf
-			((((value & 1) << 11) ^ (value & 0x800)) << 19) | // of
-			((value & 0x10) >> 1) | // af
-			((((value & 4) >> 2) ^ 1) << 8) | // pf
-			((value & 0x80) >> 7) // sf
-			);
-		new_res = ((value & 0x40) << 2); // zf
-		switch (size_or_sel)
-		{
-		case REG32:
-			cpu->cpu_ctx.regs.eflags = (value & 0x3F7FD5); // mask out reserved bits in eflags
-			cpu->cpu_ctx.lazy_eflags.result = new_res;
-			cpu->cpu_ctx.lazy_eflags.auxbits = new_aux;
-			break;
-
-		case REG16:
-			(cpu->cpu_ctx.regs.eflags &= 0xFFFF0002) |= (value & 0x7FD5); // mask out reserved bits in eflags
-			cpu->cpu_ctx.lazy_eflags.result = new_res;
-			cpu->cpu_ctx.lazy_eflags.auxbits = new_aux;
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-	}
-	break;
-
-	case REG_EIP:
-		switch (size_or_sel)
-		{
-		case REG32:
-			cpu->cpu_ctx.regs.eip = value;
-			break;
-
-		case REG16:
-			(cpu->cpu_ctx.regs.eip &= 0xFFFF0000) |= (value & 0xFFFF);
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_IDTR:
-		switch (size_or_sel)
-		{
-		case SEG_BASE:
-			cpu->cpu_ctx.regs.idtr_hidden.base = value;
-			break;
-
-		case SEG_LIMIT:
-			cpu->cpu_ctx.regs.idtr_hidden.limit = value;
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_GDTR:
-		switch (size_or_sel)
-		{
-		case SEG_BASE:
-			cpu->cpu_ctx.regs.gdtr_hidden.base = value;
-			break;
-
-		case SEG_LIMIT:
-			cpu->cpu_ctx.regs.gdtr_hidden.limit = value;
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_LDTR:
-		switch (size_or_sel)
-		{
-		case SEG_SEL:
-			cpu->cpu_ctx.regs.ldtr = (value & 0xFFFF);
-			break;
-
-		case SEG_BASE:
-			cpu->cpu_ctx.regs.ldtr_hidden.base = value;
-			break;
-
-		case SEG_LIMIT:
-			cpu->cpu_ctx.regs.ldtr_hidden.limit = value;
-			break;
-
-		case SEG_FLG:
-			cpu->cpu_ctx.regs.ldtr_hidden.flags = value;
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-
-	case REG_TR:
-		switch (size_or_sel)
-		{
-		case SEG_SEL:
-			cpu->cpu_ctx.regs.tr = (value & 0xFFFF);
-			break;
-
-		case SEG_BASE:
-			cpu->cpu_ctx.regs.tr_hidden.base = value;
-			break;
-
-		case SEG_LIMIT:
-			cpu->cpu_ctx.regs.tr_hidden.limit = value;
-			break;
-
-		case SEG_FLG:
-			cpu->cpu_ctx.regs.tr_hidden.flags = value;
-			break;
-
-		default:
-			return set_last_error(lc86_status::invalid_parameter);
-		}
-		break;
-	}
-
-	return lc86_status::success;
+	// a trampoline calls the original guest function that was hooked, and it's only supposed to get called from the host function that hooed it.
+	// This assumes that the guest state (regs and stack) are in the same state that the guest has set them when it called the hook, so that we can call
+	// the trampoline without having to set this state up ourselves. The argument ret_eip is the eip to which the trampoline returns to after if finishes
+	// executing and returns, and it tipically corresponds to the eip that the call instruction pushed on the stack.
+
+	cpu_exec_trampoline(cpu, ret_eip);
 }
 
-lc86_status
-read_fxr(cpu_t *cpu, uint64_t *low, uint64_t *high, int reg)
+/*
+* get_regs_ptr -> returns a pointer to the cpu registers (eip and eflags won't be accurate)
+* cpu: a valid cpu instance
+* ret: a pointer to the registers
+*/
+regs_t *
+get_regs_ptr(cpu_t *cpu)
 {
-	switch (reg)
-	{
-	case REG_R0:
-		*low = cpu->cpu_ctx.regs.r0.low;
-		*high = cpu->cpu_ctx.regs.r0.high;
-		break;
-
-	case REG_R1:
-		*low = cpu->cpu_ctx.regs.r1.low;
-		*high = cpu->cpu_ctx.regs.r1.high;
-		break;
-
-	case REG_R2:
-		*low = cpu->cpu_ctx.regs.r2.low;
-		*high = cpu->cpu_ctx.regs.r2.high;
-		break;
-
-	case REG_R3:
-		*low = cpu->cpu_ctx.regs.r3.low;
-		*high = cpu->cpu_ctx.regs.r3.high;
-		break;
-
-	case REG_R4:
-		*low = cpu->cpu_ctx.regs.r4.low;
-		*high = cpu->cpu_ctx.regs.r4.high;
-		break;
-
-	case REG_R5:
-		*low = cpu->cpu_ctx.regs.r5.low;
-		*high = cpu->cpu_ctx.regs.r5.high;
-		break;
-
-	case REG_R6:
-		*low = cpu->cpu_ctx.regs.r6.low;
-		*high = cpu->cpu_ctx.regs.r6.high;
-		break;
-
-	case REG_R7:
-		*low = cpu->cpu_ctx.regs.r7.low;
-		*high = cpu->cpu_ctx.regs.r7.high;
-		break;
-
-	case REG_ST:
-		*low = cpu->cpu_ctx.regs.status;
-		break;
-
-	case REG_TAG:
-		*low = cpu->cpu_ctx.regs.tag;
-		break;
-
-	default:
-		return set_last_error(lc86_status::invalid_parameter);
-	}
-
-	return lc86_status::success;
+	// Reading the eip at runtime will not yield the correct result because we only update it at the end of a tc
+	return &cpu->cpu_ctx.regs;
 }
 
-lc86_status
-write_fxr(cpu_t *cpu, uint64_t low, uint64_t high, int reg)
+/*
+* read_eflags -> reads the current value of eflags
+* cpu: a valid cpu instance
+* ret: eflags
+*/
+uint32_t
+read_eflags(cpu_t *cpu)
 {
-	switch (reg)
-	{
-	case REG_R0:
-		cpu->cpu_ctx.regs.r0.low = low;
-		cpu->cpu_ctx.regs.r0.high = high;
-		break;
+	uint32_t arth_flags = (((cpu->cpu_ctx.lazy_eflags.auxbits & 0x80000000) >> 31) | // cf
+		(((cpu->cpu_ctx.lazy_eflags.parity[(cpu->cpu_ctx.lazy_eflags.result ^ (cpu->cpu_ctx.lazy_eflags.auxbits >> 8)) & 0xFF]) ^ 1) << 2) | // pf
+		((cpu->cpu_ctx.lazy_eflags.auxbits & 8) << 1) | // af
+		(((((cpu->cpu_ctx.lazy_eflags.result | -cpu->cpu_ctx.lazy_eflags.result) >> 31) & 1) ^ 1) << 6) | // zf
+		(((cpu->cpu_ctx.lazy_eflags.result >> 31) ^ (cpu->cpu_ctx.lazy_eflags.auxbits & 1)) << 7) | // sf
+		(((cpu->cpu_ctx.lazy_eflags.auxbits ^ (cpu->cpu_ctx.lazy_eflags.auxbits << 1)) & 0x80000000) >> 20) // of
+		);
 
-	case REG_R1:
-		cpu->cpu_ctx.regs.r1.low = low;
-		cpu->cpu_ctx.regs.r1.high = high;
-		break;
+	return cpu->cpu_ctx.regs.eflags | arth_flags;
+}
 
-	case REG_R2:
-		cpu->cpu_ctx.regs.r2.low = low;
-		cpu->cpu_ctx.regs.r2.high = high;
-		break;
+/*
+* write_eflags -> writes a new value to eflags
+* cpu: a valid cpu instance
+* value: the value to write
+* reg32: true to write to eflags, false to write to flags
+* ret: nothing
+*/
+void
+write_eflags(cpu_t *cpu, uint32_t value, bool reg32)
+{
+	uint32_t new_res, new_aux;
+	new_aux = (((value & 1) << 31) | // cf
+		((((value & 1) << 11) ^ (value & 0x800)) << 19) | // of
+		((value & 0x10) >> 1) | // af
+		((((value & 4) >> 2) ^ 1) << 8) | // pf
+		((value & 0x80) >> 7) // sf
+		);
+	new_res = (((value & 0x40) << 2) ^ 0x100); // zf
 
-	case REG_R3:
-		cpu->cpu_ctx.regs.r3.low = low;
-		cpu->cpu_ctx.regs.r3.high = high;
-		break;
-
-	case REG_R4:
-		cpu->cpu_ctx.regs.r4.low = low;
-		cpu->cpu_ctx.regs.r4.high = high;
-		break;
-
-	case REG_R5:
-		cpu->cpu_ctx.regs.r5.low = low;
-		cpu->cpu_ctx.regs.r5.high = high;
-		break;
-
-	case REG_R6:
-		cpu->cpu_ctx.regs.r6.low = low;
-		cpu->cpu_ctx.regs.r6.high = high;
-		break;
-
-	case REG_R7:
-		cpu->cpu_ctx.regs.r7.low = low;
-		cpu->cpu_ctx.regs.r7.high = high;
-		break;
-
-	case REG_ST:
-		cpu->cpu_ctx.regs.status = low;
-		break;
-
-	case REG_TAG:
-		cpu->cpu_ctx.regs.tag = low;
-		break;
-
-	default:
-		return set_last_error(lc86_status::invalid_parameter);
+	// mask out reserved bits and arithmetic flags
+	if (reg32) {
+		(cpu->cpu_ctx.regs.eflags &= 2) |= (value & 0x3F7700);
 	}
-
-	return lc86_status::success;
+	else {
+		(cpu->cpu_ctx.regs.eflags &= 0xFFFF0002) |= (value & 0x7700);
+	}
+	cpu->cpu_ctx.lazy_eflags.result = new_res;
+	cpu->cpu_ctx.lazy_eflags.auxbits = new_aux;
 }

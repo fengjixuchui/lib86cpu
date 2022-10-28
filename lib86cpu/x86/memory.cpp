@@ -9,6 +9,75 @@
 #include <assert.h>
 
 
+void
+rom_flush_cached(cpu_t *cpu, memory_region_t<addr_t> *rom)
+{
+	auto it = std::find_if(cpu->rom_regions.begin(), cpu->rom_regions.end(), [rom](const cached_rom_region &region) {
+		return rom == region.rom;
+		});
+
+	if (it != cpu->rom_regions.end()) {
+		// erasing an element invalidates all iterators/pointers to that element and after it, and element indices are changed as well, so we need
+		// to flush all entries of the affected regions
+		tlb_flush(cpu, TLB_rom);
+		cpu->rom_regions.erase(it);
+	}
+}
+
+void
+mmio_flush_cached(cpu_t *cpu, memory_region_t<addr_t> *mmio)
+{
+	auto it = std::find_if(cpu->mmio_regions.begin(), cpu->mmio_regions.end(), [mmio](const cached_mmio_region &region) {
+		return mmio == region.mmio;
+		});
+
+	if (it != cpu->mmio_regions.end()) {
+		// erasing an element invalidates all iterators/pointers to that element and after it, and element indices are changed as well, so we need
+		// to flush all entries of the affected regions
+		tlb_flush(cpu, TLB_mmio);
+		cpu->mmio_regions.erase(it);
+	}
+}
+
+void
+iotlb_fill(cpu_t *cpu, port_t port, memory_region_t<port_t> *io)
+{
+	auto it = std::find_if(cpu->iotlb_regions.begin(), cpu->iotlb_regions.end(), [io](const cached_io_region &region) {
+		return io == region.io;
+		});
+
+	if (it == cpu->iotlb_regions.end()) {
+		// note that emplace_back can invalidate all iterators/pointers, but not the element indices, so we don't need to flush the iotlb
+		cpu->iotlb_regions.emplace_back(io, io->read_handler, io->write_handler, io->opaque);
+		cpu->iotlb_regions_ptr = &cpu->iotlb_regions[0];
+		it = std::prev(cpu->iotlb_regions.end(), 1);
+	}
+
+	unsigned iotlb_idx = port >> IO_SHIFT;
+	cpu->cpu_ctx.iotlb[iotlb_idx] = ((cpu->cpu_ctx.iotlb[iotlb_idx] & IOTLB_WATCH) | (IOTLB_VALID | (std::distance(cpu->iotlb_regions.begin(), it) << IO_SHIFT)));
+}
+
+void
+iotlb_flush(cpu_t *cpu, memory_region_t<port_t> *io)
+{
+	auto it = std::find_if(cpu->iotlb_regions.begin(), cpu->iotlb_regions.end(), [io](const cached_io_region &region) {
+		return io == region.io;
+		});
+
+	if (it != cpu->iotlb_regions.end()) {
+		// erasing an element invalidates all iterators/pointers to that element and after it, and element indices are changed as well, so we need
+		// to flush all entries of the affected regions
+		std::for_each(it, cpu->iotlb_regions.end(), [cpu](const cached_io_region &region) {
+			for (port_t port = region.io->start; port <= region.io->end; port += IO_SIZE) {
+				unsigned iotlb_idx = port >> IO_SHIFT;
+				cpu->cpu_ctx.iotlb[iotlb_idx] = (cpu->cpu_ctx.iotlb[iotlb_idx] & IOTLB_WATCH);
+			}
+			});
+		cpu->iotlb_regions.erase(it);
+		cpu->iotlb_regions_ptr = &cpu->iotlb_regions[0];
+	}
+}
+
 static uint32_t
 tlb_gen_access_mask(cpu_t *cpu, uint8_t user, uint8_t is_write)
 {
@@ -38,16 +107,55 @@ tlb_fill(cpu_t *cpu, addr_t addr, addr_t phys_addr, uint32_t prot)
 {
 	assert((prot & ~PAGE_MASK) == 0);
 
+	uint32_t offset = 0;
+	unsigned tlb_idx = addr >> PAGE_SHIFT;
 	memory_region_t<addr_t> *region = as_memory_search_addr<uint8_t>(cpu, phys_addr);
+
+	if (region->type == mem_type::alias) {
+		while (region->aliased_region) {
+			offset += (region->start - (region->alias_offset + region->aliased_region->start));
+			region = region->aliased_region;
+		}
+	}
+
 	if (region->type == mem_type::ram) {
-		phys_addr -= region->start;
-		prot |= TLB_RAM;
+		phys_addr -= (offset - region->start);
+		cpu->cpu_ctx.tlb[tlb_idx] = (phys_addr & ~PAGE_MASK) | (prot | TLB_RAM) | (cpu->cpu_ctx.tlb[tlb_idx] & TLB_WATCH);
 	}
 	else if (region->type == mem_type::rom) {
 		prot &= ~TLB_CODE;
-	}
 
-	cpu->cpu_ctx.tlb[addr >> PAGE_SHIFT] = (phys_addr & ~PAGE_MASK) | prot;
+		auto it = std::find_if(cpu->rom_regions.begin(), cpu->rom_regions.end(), [region](const cached_rom_region &region2) {
+			return region == region2.rom;
+			});
+
+		if (it == cpu->rom_regions.end()) {
+			// note that emplace_back can invalidate all iterators/pointers, but not the element indices, so we don't need to flush the iotlb
+			cpu->rom_regions.emplace_back(region, cpu->vec_rom[region->rom_idx].get());
+			it = std::prev(cpu->rom_regions.end(), 1);
+		}
+
+		phys_addr -= (offset - region->start);
+		cpu->cpu_ctx.tlb[tlb_idx] = (phys_addr & ~PAGE_MASK) | prot | TLB_ROM | (cpu->cpu_ctx.tlb[tlb_idx] & TLB_WATCH);
+		cpu->cpu_ctx.tlb_region_idx[tlb_idx] = std::distance(cpu->rom_regions.begin(), it);
+	}
+	else if (region->type == mem_type::mmio) {
+		auto it = std::find_if(cpu->mmio_regions.begin(), cpu->mmio_regions.end(), [region](const cached_mmio_region &region2) {
+			return region == region2.mmio;
+			});
+
+		if (it == cpu->mmio_regions.end()) {
+			// note that emplace_back can invalidate all iterators/pointers, but not the element indices, so we don't need to flush the iotlb
+			cpu->mmio_regions.emplace_back(region, region->read_handler, region->write_handler, region->opaque);
+			it = std::prev(cpu->mmio_regions.end(), 1);
+		}
+
+		cpu->cpu_ctx.tlb[tlb_idx] = (phys_addr & ~PAGE_MASK) | prot | TLB_MMIO | (cpu->cpu_ctx.tlb[tlb_idx] & TLB_WATCH);
+		cpu->cpu_ctx.tlb_region_idx[tlb_idx] = std::distance(cpu->mmio_regions.begin(), it);
+	}
+	else {
+		cpu->cpu_ctx.tlb[tlb_idx] = (phys_addr & ~PAGE_MASK) | prot | (cpu->cpu_ctx.tlb[tlb_idx] & TLB_WATCH);
+	}
 }
 
 void
@@ -57,20 +165,36 @@ tlb_flush(cpu_t *cpu, int n)
 	{
 	case TLB_zero:
 		for (uint32_t &tlb_entry : cpu->cpu_ctx.tlb) {
-			tlb_entry = 0;
+			tlb_entry = (tlb_entry & TLB_WATCH);
 		}
 		break;
 
-	case TLB_keep_rc:
+	case TLB_keep_cw:
 		for (uint32_t &tlb_entry : cpu->cpu_ctx.tlb) {
-			tlb_entry = (tlb_entry & (TLB_RAM | TLB_CODE));
+			tlb_entry = (tlb_entry & (TLB_CODE | TLB_WATCH));
 		}
 		break;
 
 	case TLB_no_g:
 		for (uint32_t &tlb_entry : cpu->cpu_ctx.tlb) {
 			if (!(tlb_entry & TLB_GLOBAL)) {
-				tlb_entry = (tlb_entry & (TLB_RAM | TLB_CODE));
+				tlb_entry = (tlb_entry & (TLB_CODE | TLB_WATCH));
+			}
+		}
+		break;
+
+	case TLB_rom:
+		for (uint32_t &tlb_entry : cpu->cpu_ctx.tlb) {
+			if (tlb_entry & TLB_ROM) {
+				tlb_entry = (tlb_entry & TLB_WATCH);
+			}
+		}
+		break;
+
+	case TLB_mmio:
+		for (uint32_t &tlb_entry : cpu->cpu_ctx.tlb) {
+			if (tlb_entry & TLB_MMIO) {
+				tlb_entry = (tlb_entry & TLB_WATCH);
 			}
 		}
 		break;
@@ -195,7 +319,7 @@ addr_t mmu_translate_addr(cpu_t *cpu, addr_t addr, uint8_t flags, uint32_t eip, 
 		uint8_t err_code = 0;
 		uint8_t cpu_lv = cpl_to_page_priv[cpu->cpu_ctx.hflags & HFLG_CPL];
 		addr_t pde_addr = (cpu->cpu_ctx.regs.cr3 & CR3_PD_MASK) | (addr >> PAGE_SHIFT_LARGE) * 4;
-		uint32_t pde = ram_read<uint32_t>(cpu, get_ram_host_ptr(cpu, as_memory_search_addr<uint8_t>(cpu, cpu->cpu_ctx.regs.cr3 & CR3_PD_MASK), pde_addr));
+		uint32_t pde = as_memory_dispatch_read<uint32_t>(cpu, pde_addr, as_memory_search_addr<uint8_t>(cpu, pde_addr));
 
 		if (!(pde & PTE_PRESENT)) {
 			mmu_raise_page_fault<raise_host_exp>(cpu, addr, eip, disas_ctx, err_code, is_write, cpu_lv);
@@ -211,7 +335,7 @@ addr_t mmu_translate_addr(cpu_t *cpu, addr_t addr, uint8_t flags, uint32_t eip, 
 					if (is_write) {
 						pde |= PTE_DIRTY;
 					}
-					ram_write<uint32_t>(cpu, get_ram_host_ptr(cpu, as_memory_search_addr<uint8_t>(cpu, cpu->cpu_ctx.regs.cr3 & CR3_PD_MASK), pde_addr), pde);
+					as_memory_dispatch_write<uint32_t>(cpu, pde_addr, pde, as_memory_search_addr<uint8_t>(cpu, pde_addr));
 				}
 				addr_t phys_addr = (pde & PTE_ADDR_4M) | (addr & PAGE_MASK_LARGE);
 				tlb_fill(cpu, addr, phys_addr,
@@ -225,7 +349,7 @@ addr_t mmu_translate_addr(cpu_t *cpu, addr_t addr, uint8_t flags, uint32_t eip, 
 		}
 
 		addr_t pte_addr = (pde & PTE_ADDR_4K) | ((addr >> PAGE_SHIFT) & 0x3FF) * 4;
-		uint32_t pte = ram_read<uint32_t>(cpu, get_ram_host_ptr(cpu, as_memory_search_addr<uint8_t>(cpu, cpu->cpu_ctx.regs.cr3 & CR3_PD_MASK), pte_addr));
+		uint32_t pte = as_memory_dispatch_read<uint32_t>(cpu, pte_addr, as_memory_search_addr<uint8_t>(cpu, pte_addr));
 
 		if (!(pte & PTE_PRESENT)) {
 			mmu_raise_page_fault<raise_host_exp>(cpu, addr, eip, disas_ctx, err_code, is_write, cpu_lv);
@@ -238,14 +362,14 @@ addr_t mmu_translate_addr(cpu_t *cpu, addr_t addr, uint8_t flags, uint32_t eip, 
 				// NOTE: pdes that map page tables do not use the dirty bit. Also note that we must check this here because, if a pde is valid but the pte is not,
 				// a page fault will occur and the accessed bit should not be set
 				pde |= PTE_ACCESSED;
-				ram_write<uint32_t>(cpu, get_ram_host_ptr(cpu, as_memory_search_addr<uint8_t>(cpu, cpu->cpu_ctx.regs.cr3 & CR3_PD_MASK), pde_addr), pde);
+				as_memory_dispatch_write<uint32_t>(cpu, pde_addr, pde, as_memory_search_addr<uint8_t>(cpu, pde_addr));
 			}
 			if (!(pte & PTE_ACCESSED) || is_write) {
 				pte |= PTE_ACCESSED;
 				if (is_write) {
 					pte |= PTE_DIRTY;
 				}
-				ram_write<uint32_t>(cpu, get_ram_host_ptr(cpu, as_memory_search_addr<uint8_t>(cpu, cpu->cpu_ctx.regs.cr3 & CR3_PD_MASK), pte_addr), pte);
+				as_memory_dispatch_write<uint32_t>(cpu, pte_addr, pte, as_memory_search_addr<uint8_t>(cpu, pte_addr));
 			}
 			addr_t phys_addr = (pte & PTE_ADDR_4K) | (addr & PAGE_MASK);
 			tlb_fill(cpu, addr, phys_addr,
@@ -302,23 +426,28 @@ get_code_addr(cpu_t *cpu, addr_t addr, uint32_t eip)
 }
 
 addr_t
-get_code_addr(cpu_t *cpu, addr_t addr, uint32_t eip, disas_ctx_t *disas_ctx)
+get_code_addr(cpu_t *cpu, addr_t addr, uint32_t eip, uint32_t is_code, disas_ctx_t *disas_ctx)
 {
-	// overloaded get_code_addr that does not throw host exceptions
+	// overloaded get_code_addr that does not throw host exceptions, used in cpu_translate and by the debugger
+	// NOTE: the debugger should not set is_code, since it doesn't execute the instructions
 
 	uint32_t tlb_entry = cpu->cpu_ctx.tlb[addr >> PAGE_SHIFT];
 	if ((tlb_entry & (tlb_access[0][cpu->cpu_ctx.hflags & HFLG_CPL])) == 0) {
-		return mmu_translate_addr<false>(cpu, addr, TLB_CODE, eip, disas_ctx);
+		return mmu_translate_addr<false>(cpu, addr, is_code, eip, disas_ctx);
 	}
 
-	cpu->cpu_ctx.tlb[addr >> PAGE_SHIFT] = tlb_entry | TLB_CODE;
+	cpu->cpu_ctx.tlb[addr >> PAGE_SHIFT] = tlb_entry | is_code;
 	return (tlb_entry & ~PAGE_MASK) | (addr & PAGE_MASK);
 }
 
 size_t
 as_ram_dispatch_read(cpu_t *cpu, addr_t addr, size_t size, memory_region_t<addr_t> *region, uint8_t *buffer)
 {
+#if defined(_WIN64)
+	size_t bytes_to_read = std::min((region->end - addr) + 1ULL, size);
+#else
 	size_t bytes_to_read = std::min((region->end - addr) + 1, size);
+#endif
 
 	switch (region->type)
 	{
@@ -362,7 +491,7 @@ ram_fetch(cpu_t *cpu, disas_ctx_t *disas_ctx, uint8_t *buffer)
 			return;
 		}
 
-		addr_t addr = get_code_addr(cpu, disas_ctx->virt_pc + bytes_in_first_page, disas_ctx->virt_pc - cpu->cpu_ctx.regs.cs_hidden.base, disas_ctx);
+		addr_t addr = get_code_addr(cpu, disas_ctx->virt_pc + bytes_in_first_page, disas_ctx->virt_pc - cpu->cpu_ctx.regs.cs_hidden.base, TLB_CODE, disas_ctx);
 		if (disas_ctx->exp_data.idx == EXP_PF) {
 			// a page fault will be raised when fetching from the second page
 			disas_ctx->instr_buff_size = bytes_in_first_page;
@@ -379,52 +508,106 @@ ram_fetch(cpu_t *cpu, disas_ctx_t *disas_ctx, uint8_t *buffer)
 	}
 }
 
-uint8_t
-mem_read8(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t eip, uint8_t is_phys)
+// memory read helper invoked by the llvm generated code
+template<typename T>
+T mem_read_helper(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t eip, uint8_t is_priv)
 {
-	return mem_read<uint8_t>(cpu_ctx->cpu, addr, eip, is_phys);
+	uint32_t tlb_idx1 = addr >> PAGE_SHIFT;
+	uint32_t tlb_idx2 = (addr + sizeof(T) - 1) >> PAGE_SHIFT;
+	uint32_t tlb_entry = cpu_ctx->tlb[tlb_idx1];
+	uint32_t mem_access = tlb_access[0][(cpu_ctx->hflags & HFLG_CPL) >> is_priv];
+
+	// interrogate the tlb
+	// this checks the page privilege access (mem_access) and also if the last byte of the read is in the same page as the first (addr + sizeof(T) - 1)
+	// reads that cross pages or that reside in a page where a watchpoint is installed always result in tlb misses
+	if ((((tlb_entry & (mem_access | TLB_WATCH)) | (tlb_idx1 << PAGE_SHIFT)) ^ (mem_access | (tlb_idx2 << PAGE_SHIFT))) == 0) {
+		// tlb hit, check the region type
+		addr_t phys_addr = (tlb_entry & ~PAGE_MASK) | (addr & PAGE_MASK);
+		switch (tlb_entry & (TLB_RAM | TLB_ROM | TLB_MMIO))
+		{
+		case TLB_RAM: {
+			// it's ram, access it directly
+			T ret = *reinterpret_cast<T *>(&cpu_ctx->ram[phys_addr]);
+			if constexpr (is_big_endian) {
+				sys::swapByteOrder<T>(ret);
+			}
+			return ret;
+		}
+
+		case TLB_ROM: {
+			// it's rom, find the buffer pointer and access it directly
+			cached_rom_region *rom = &cpu_ctx->cpu->rom_regions[cpu_ctx->tlb_region_idx[tlb_idx1]];
+			T ret = *reinterpret_cast<T *>(&rom->buffer[phys_addr]);
+			if constexpr (is_big_endian) {
+				sys::swapByteOrder<T>(ret);
+			}
+			return ret;
+		}
+
+		case TLB_MMIO: {
+			// it's mmio, invoke the handler directly
+			cached_mmio_region *mmio = &cpu_ctx->cpu->mmio_regions[cpu_ctx->tlb_region_idx[tlb_idx1]];
+			return mmio->read_handler(phys_addr, sizeof(T), mmio->opaque);
+		}
+
+		default:
+			// unknown region type, acccess the memory region with the external handler
+			// because all other region types are cached, this should only happen with the unmapped region
+			return mem_read<T>(cpu_ctx->cpu, phys_addr, eip, 1 | is_priv);
+		}
+	}
+
+	// tlb miss, acccess the memory region with is_phys flag=0
+	return mem_read<T>(cpu_ctx->cpu, addr, eip, is_priv);
 }
 
-uint16_t
-mem_read16(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t eip, uint8_t is_phys)
+// memory write helper invoked by the llvm generated code
+template<typename T>
+void mem_write_helper(cpu_ctx_t *cpu_ctx, addr_t addr, T val, uint32_t eip, uint8_t is_priv)
 {
-	return mem_read<uint16_t>(cpu_ctx->cpu, addr, eip, is_phys);
-}
+	uint32_t tlb_idx1 = addr >> PAGE_SHIFT;
+	uint32_t tlb_idx2 = (addr + sizeof(T) - 1) >> PAGE_SHIFT;
+	uint32_t tlb_entry = cpu_ctx->tlb[tlb_idx1];
+	uint32_t mem_access = (tlb_access[1][(cpu_ctx->hflags & HFLG_CPL) >> is_priv]) | TLB_DIRTY;
 
-uint32_t
-mem_read32(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t eip, uint8_t is_phys)
-{
-	return mem_read<uint32_t>(cpu_ctx->cpu, addr, eip, is_phys);
-}
+	// interrogate the tlb
+	// this checks the page privilege access (mem_access), if the last byte of the write is in the same page as the first (addr + sizeof(T) - 1) and
+	// the tlb dirty flag. Writes that cross pages or that hit a page where a watchpoint is installed or there is translated code always result in tlb misses,
+	// and writes without the dirty flag set miss only once
+	if ((((tlb_entry & (mem_access | TLB_CODE | TLB_WATCH)) | (tlb_idx1 << PAGE_SHIFT)) ^ (mem_access | (tlb_idx2 << PAGE_SHIFT))) == 0) {
+		// tlb hit, check the region type
+		addr_t phys_addr = (tlb_entry & ~PAGE_MASK) | (addr & PAGE_MASK);
+		switch (tlb_entry & (TLB_RAM | TLB_ROM | TLB_MMIO))
+		{
+		case TLB_RAM:
+			// it's ram, access it directly
+			if constexpr (is_big_endian) {
+				sys::swapByteOrder<T>(val);
+			}
+			*reinterpret_cast<T *>(&cpu_ctx->ram[phys_addr]) = val;
+			return;
 
-uint64_t
-mem_read64(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t eip, uint8_t is_phys)
-{
-	return mem_read<uint64_t>(cpu_ctx->cpu, addr, eip, is_phys);
-}
+		case TLB_ROM:
+			// it's rom, ignore it
+			return;
 
-void
-mem_write8(cpu_ctx_t *cpu_ctx, addr_t addr, uint8_t value, uint32_t eip, uint8_t is_phys, translated_code_t *tc)
-{
-	mem_write<uint8_t>(cpu_ctx->cpu, addr, value, eip, is_phys, tc);
-}
+		case TLB_MMIO: {
+			// it's mmio, invoke the handler directly
+			cached_mmio_region *mmio = &cpu_ctx->cpu->mmio_regions[cpu_ctx->tlb_region_idx[tlb_idx1]];
+			mmio->write_handler(phys_addr, sizeof(T), val, mmio->opaque);
+			return;
+		}
 
-void
-mem_write16(cpu_ctx_t *cpu_ctx, addr_t addr, uint16_t value, uint32_t eip, uint8_t is_phys, translated_code_t *tc)
-{
-	mem_write<uint16_t>(cpu_ctx->cpu, addr, value, eip, is_phys, tc);
-}
+		default:
+			// unknown region type, acccess the memory region with the external handler
+			// because all other region types are cached, this should only happen with the unmapped region
+			mem_write<T>(cpu_ctx->cpu, phys_addr, val, eip, 1 | is_priv);
+			return;
+		}
+	}
 
-void
-mem_write32(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t value, uint32_t eip, uint8_t is_phys, translated_code_t *tc)
-{
-	mem_write<uint32_t>(cpu_ctx->cpu, addr, value, eip, is_phys, tc);
-}
-
-void
-mem_write64(cpu_ctx_t *cpu_ctx, addr_t addr, uint64_t value, uint32_t eip, uint8_t is_phys, translated_code_t *tc)
-{
-	mem_write<uint64_t>(cpu_ctx->cpu, addr, value, eip, is_phys, tc);
+	// tlb miss, acccess the memory region with is_phys flag=0
+	mem_write<T>(cpu_ctx->cpu, addr, val, eip, is_priv);
 }
 
 uint8_t
@@ -462,3 +645,12 @@ io_write32(cpu_ctx_t *cpu_ctx, port_t port, uint32_t value)
 {
 	io_write<uint32_t>(cpu_ctx->cpu, port, value);
 }
+
+template uint8_t mem_read_helper(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t eip, uint8_t is_priv);
+template uint16_t mem_read_helper(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t eip, uint8_t is_priv);
+template uint32_t mem_read_helper(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t eip, uint8_t is_priv);
+template uint64_t mem_read_helper(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t eip, uint8_t is_priv);
+template void mem_write_helper(cpu_ctx_t *cpu_ctx, addr_t addr, uint8_t val, uint32_t eip, uint8_t is_priv);
+template void mem_write_helper(cpu_ctx_t *cpu_ctx, addr_t addr, uint16_t val, uint32_t eip, uint8_t is_priv);
+template void mem_write_helper(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t val, uint32_t eip, uint8_t is_priv);
+template void mem_write_helper(cpu_ctx_t *cpu_ctx, addr_t addr, uint64_t val, uint32_t eip, uint8_t is_priv);

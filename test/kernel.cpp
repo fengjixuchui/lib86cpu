@@ -12,6 +12,7 @@
 #define CONTIGUOUS_MEMORY_BASE 0x80000000
 
 #define DBG_STR_PORT 0x200
+#define SYS_TYPE_PORT 0x204
 
 // Windows PE format definitions
 #define IMAGE_DOS_SIGNATURE 0x5A4D
@@ -117,22 +118,42 @@ typedef struct _IMAGE_SECTION_HEADER {
 } IMAGE_SECTION_HEADER, *PIMAGE_SECTION_HEADER;
 
 
-static void
-dbg_write_handler(addr_t addr, size_t size, const uint64_t value, void* opaque)
+static uint64_t
+host_read_handler(addr_t addr, size_t size, void *opaque)
 {
+	if (size != 4) {
+		std::printf("%s: unexpected i/o read at port %d with size %d\n", __func__, addr, static_cast<uint32_t>(size));
+		return std::numeric_limits<uint64_t>::max();
+	}
+
 	switch (addr)
 	{
-	case DBG_STR_PORT: {
-		if (size == 4) {
-			// NOTE: get_host_ptr will only work if the string is allocated with a contiguous allocation in physical memory, to avoid
-			// issues with allocations spanning pages; cxbxrkrnl should guarantee this
-			std::printf("Received a new debug string from kernel:\n%s", get_host_ptr(static_cast<cpu_t *>(opaque), static_cast<addr_t>(value)));
-		}
-		else {
-			std::printf("%s: unexpected i/o write at port %d with size %d\n", __func__, addr, size);
-		}
+	case SYS_TYPE_PORT:
+		// For now, we always want an xbox system. 0: xbox, 1: chihiro, 2: devkit
+		return 0ULL;
+
+	default:
+		std::printf("%s: unexpected i/o read at port %d\n", __func__, addr);
 	}
-	break;
+
+	return std::numeric_limits<uint64_t>::max();
+}
+
+static void
+host_write_handler(addr_t addr, size_t size, const uint64_t value, void* opaque)
+{
+	if (size != 4) {
+		std::printf("%s: unexpected i/o write at port %d with size %d\n", __func__, addr, static_cast<uint32_t>(size));
+		return;
+	}
+
+	switch (addr)
+	{
+	case DBG_STR_PORT:
+		// NOTE: get_host_ptr will only work if the string is allocated with a contiguous allocation in physical memory, to avoid
+		// issues with allocations spanning pages; cxbxrkrnl should guarantee this
+		std::printf("Received a new debug string from kernel:\n%s", get_host_ptr(static_cast<cpu_t *>(opaque), static_cast<addr_t>(value)));
+		break;
 
 	default:
 		std::printf("%s: unexpected i/o write at port %d\n", __func__, addr);
@@ -194,7 +215,7 @@ gen_cxbxrkrnl_test(const std::string &executable)
 	}
 
 	// Init lib86cpu
-	if (!LIB86CPU_CHECK_SUCCESS(cpu_new(ramsize, cpu))) {
+	if (!LIB86CPU_CHECK_SUCCESS(cpu_new(ramsize, cpu, "cxbxrkrnl"))) {
 		std::printf("Failed to create cpu!\n");
 		return false;
 	}
@@ -204,13 +225,13 @@ gen_cxbxrkrnl_test(const std::string &executable)
 		return false;
 	}
 
-	if (!LIB86CPU_CHECK_SUCCESS(mem_init_region_ram(cpu, CONTIGUOUS_MEMORY_BASE, ramsize, 1))) {
+	if (!LIB86CPU_CHECK_SUCCESS(mem_init_region_alias(cpu, CONTIGUOUS_MEMORY_BASE, 0, ramsize, 1))) {
 		std::printf("Failed to initialize contiguous memory!\n");
 		return false;
 	}
 
-	if (!LIB86CPU_CHECK_SUCCESS(mem_init_region_io(cpu, DBG_STR_PORT, 4, true, nullptr, dbg_write_handler, cpu, 1))) {
-		std::printf("Failed to initialize debug port!\n");
+	if (!LIB86CPU_CHECK_SUCCESS(mem_init_region_io(cpu, DBG_STR_PORT, 8, true, host_read_handler, host_write_handler, cpu, 1))) {
+		std::printf("Failed to initialize host communication i/o ports!\n");
 		return false;
 	}
 
@@ -242,27 +263,31 @@ gen_cxbxrkrnl_test(const std::string &executable)
 	pde = 0x0000F063; // dirty, accessed, r/w, present
 	mem_write_block(cpu, 0xFC00, 4, &pde); // this maps the pd at 0xC0000000
 
-	write_gpr(cpu, 0x0, REG_CS, SEG_BASE);
-	write_gpr(cpu, 0x0, REG_ES, SEG_BASE);
-	write_gpr(cpu, 0x0, REG_DS, SEG_BASE);
-	write_gpr(cpu, 0x0, REG_SS, SEG_BASE);
-	write_gpr(cpu, 0x0, REG_FS, SEG_BASE);
-	write_gpr(cpu, 0x0, REG_GS, SEG_BASE);
+	regs_t *regs = get_regs_ptr(cpu);
+	regs->cs_hidden.base = 0;
+	regs->es_hidden.base = 0;
+	regs->ds_hidden.base = 0;
+	regs->ss_hidden.base = 0;
+	regs->fs_hidden.base = 0;
+	regs->gs_hidden.base = 0;
 
-	write_gpr(cpu, 0xCF9F00, REG_CS, SEG_FLG);
-	write_gpr(cpu, 0xCF9700, REG_ES, SEG_FLG);
-	write_gpr(cpu, 0xCF9700, REG_DS, SEG_FLG);
-	write_gpr(cpu, 0xCF9700, REG_SS, SEG_FLG);
-	write_gpr(cpu, 0xCF9700, REG_FS, SEG_FLG);
-	write_gpr(cpu, 0xCF9700, REG_GS, SEG_FLG);
+	regs->cs_hidden.flags = 0xCF9F00;
+	regs->es_hidden.flags = 0xCF9700;
+	regs->ds_hidden.flags = 0xCF9700;
+	regs->ss_hidden.flags = 0xCF9700;
+	regs->fs_hidden.flags = 0xCF9700;
+	regs->gs_hidden.flags = 0xCF9700;
 
-	write_gpr(cpu, 0x80000001, REG_CR0); // protected, paging
-	write_gpr(cpu, 0xF000, REG_CR3); // pd addr
-	write_gpr(cpu, 0x10, REG_CR4); // pse
+	regs->cr0 = 0x80000001; // protected, paging
+	regs->cr3 = 0xF000; // pd addr
+	regs->cr4 = 0x10; // pse
 
-	write_gpr(cpu, 0x80400000, REG_ESP);
-	write_gpr(cpu, 0x80400000, REG_EBP);
-	write_gpr(cpu, peHeader->OptionalHeader.ImageBase + peHeader->OptionalHeader.AddressOfEntryPoint, REG_EIP);
+	regs->esp = 0x80400000;
+	regs->ebp = 0x80400000;
+	regs->eip = peHeader->OptionalHeader.ImageBase + peHeader->OptionalHeader.AddressOfEntryPoint;
+
+	// Pass eeprom and certificate keys on the stack (we use dummy all-zero keys)
+	mem_fill_block(cpu, 0x80400000, 16 * 2, 0);
 
 	return true;
 }

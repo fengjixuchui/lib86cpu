@@ -17,6 +17,7 @@ print_help()
 options: \n\
 -p         Print llvm IR code\n\
 -i         Use Intel syntax (default is AT&T)\n\
+-d         Start with debugger\n\
 -t <num>   Run a test specified by num\n\
 -h         Print this message\n";
 
@@ -27,9 +28,10 @@ static void
 logger(log_level lv, const unsigned count, const char *msg, ...)
 {
 	static const std::unordered_map<log_level, std::string> lv_to_str = {
-		{log_level::debug, "DBG:  "},
-		{log_level::info,  "INFO: "},
-		{log_level::warn,  "WARN: "}
+		{log_level::debug, "DBG:   "},
+		{log_level::info,  "INFO:  "},
+		{log_level::warn,  "WARN:  "},
+		{log_level::error, "ERROR: "},
 	};
 
 	std::string str;
@@ -58,6 +60,7 @@ main(int argc, char **argv)
 	std::string executable;
 	int print_ir = 0;
 	int intel_syntax = 0;
+	int use_dbg = 0;
 	int test_num = -1;
 
 	/* parameter parsing */
@@ -78,6 +81,10 @@ main(int argc, char **argv)
 
 				case 'i':
 					intel_syntax = 1;
+					break;
+
+				case 'd':
+					use_dbg = 1;
 					break;
 
 				case 't':
@@ -160,7 +167,7 @@ main(int argc, char **argv)
 
 	register_log_func(logger);
 	cpu_set_flags(cpu, (print_ir ? (CPU_PRINT_IR | CPU_PRINT_IR_OPTIMIZED) : 0) |
-		(intel_syntax ? CPU_INTEL_SYNTAX : 0) | CPU_CODEGEN_OPTIMIZE);
+		(intel_syntax ? CPU_INTEL_SYNTAX : 0) | (use_dbg ? CPU_DBG_PRESENT : 0) | CPU_CODEGEN_OPTIMIZE);
 
 	lc86_status code = cpu_run(cpu);
 	std::printf("Emulation terminated with status %d. The error was \"%s\"\n", code, get_last_error().c_str());

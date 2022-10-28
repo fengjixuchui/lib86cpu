@@ -17,20 +17,14 @@ while (region->aliased_region) { \
 }
 
 void tlb_flush(cpu_t *cpu, int n);
+void iotlb_fill(cpu_t * cpu, port_t port, memory_region_t<port_t> *io);
+void iotlb_flush(cpu_t * cpu, memory_region_t<port_t> *io);
 inline void *get_rom_host_ptr(cpu_t *cpu, memory_region_t<addr_t> *rom, addr_t addr);
 inline void *get_ram_host_ptr(cpu_t *cpu, memory_region_t<addr_t> *ram, addr_t addr);
 addr_t get_read_addr(cpu_t *cpu, addr_t addr, uint8_t is_priv, uint32_t eip);
 addr_t get_write_addr(cpu_t *cpu, addr_t addr, uint8_t is_priv, uint32_t eip, uint8_t *is_code);
 addr_t get_code_addr(cpu_t *cpu, addr_t addr, uint32_t eip);
-addr_t get_code_addr(cpu_t * cpu, addr_t addr, uint32_t eip, disas_ctx_t *disas_ctx);
-uint8_t mem_read8(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t eip, uint8_t is_phys);
-uint16_t mem_read16(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t eip, uint8_t is_phys);
-uint32_t mem_read32(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t eip, uint8_t is_phys);
-uint64_t mem_read64(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t eip, uint8_t is_phys);
-void mem_write8(cpu_ctx_t *cpu_ctx, addr_t addr, uint8_t value, uint32_t eip, uint8_t is_phys, translated_code_t * tc);
-void mem_write16(cpu_ctx_t *cpu_ctx, addr_t addr, uint16_t value, uint32_t eip, uint8_t is_phys, translated_code_t * tc);
-void mem_write32(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t value, uint32_t eip, uint8_t is_phys, translated_code_t * tc);
-void mem_write64(cpu_ctx_t * cpu_ctx, addr_t addr, uint64_t value, uint32_t eip, uint8_t is_phys, translated_code_t * tc);
+addr_t get_code_addr(cpu_t * cpu, addr_t addr, uint32_t eip, uint32_t is_code, disas_ctx_t *disas_ctx);
 uint8_t io_read8(cpu_ctx_t *cpu_ctx, port_t port);
 uint16_t io_read16(cpu_ctx_t *cpu_ctx, port_t port);
 uint32_t io_read32(cpu_ctx_t *cpu_ctx, port_t port);
@@ -41,6 +35,10 @@ template<typename T> T ram_read(cpu_t *cpu, void *ram_ptr);
 template<typename T> void ram_write(cpu_t *cpu, void *ram_ptr, T value);
 void ram_fetch(cpu_t *cpu, disas_ctx_t *disas_ctx, uint8_t *buffer);
 size_t as_ram_dispatch_read(cpu_t *cpu, addr_t addr, size_t size, memory_region_t<addr_t> *region, uint8_t *buffer);
+void rom_flush_cached(cpu_t * cpu, memory_region_t<addr_t> *rom);
+void mmio_flush_cached(cpu_t * cpu, memory_region_t<addr_t> *mmio);
+template<typename T> T mem_read_helper(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t eip, uint8_t is_priv);
+template<typename T> void mem_write_helper(cpu_ctx_t *cpu_ctx, addr_t addr, T val, uint32_t eip, uint8_t is_priv);
 
 inline const uint8_t tlb_access[2][4] = {
 	{ TLB_SUP_READ, TLB_SUP_READ, TLB_SUP_READ, TLB_USER_READ },
@@ -147,11 +145,8 @@ T as_io_dispatch_read(cpu_t *cpu, port_t port, memory_region_t<port_t> *region)
 		switch (region->type)
 		{
 		case mem_type::pmio:
-			return static_cast<T>(region->read_handler(port, sizeof(T), region->opaque));
-
 		case mem_type::unmapped:
-			LOG(log_level::warn, "Memory read to unmapped memory at port %#06hx with size %d", port, sizeof(T));
-			return std::numeric_limits<T>::max();
+			return static_cast<T>(region->read_handler(port, sizeof(T), region->opaque));
 
 		default:
 			LIB86CPU_ABORT();
@@ -170,11 +165,8 @@ void as_io_dispatch_write(cpu_t *cpu, port_t port, T value, memory_region_t<port
 		switch (region->type)
 		{
 		case mem_type::pmio:
-			region->write_handler(port, sizeof(T), value, region->opaque);
-			break;
-
 		case mem_type::unmapped:
-			LOG(log_level::warn, "Memory write to unmapped memory at port %#06hx with size %d", port, sizeof(T));
+			region->write_handler(port, sizeof(T), value, region->opaque);
 			break;
 
 		default:
@@ -192,7 +184,7 @@ void as_io_dispatch_write(cpu_t *cpu, port_t port, T value, memory_region_t<port
 void *
 get_rom_host_ptr(cpu_t *cpu, memory_region_t<addr_t> *rom, addr_t addr)
 {
-	return &cpu->vec_rom[rom->rom_idx].first[addr - rom->start];
+	return &cpu->vec_rom[rom->rom_idx][addr - rom->start];
 }
 
 void *
@@ -231,7 +223,7 @@ T mem_read(cpu_t *cpu, addr_t addr, uint32_t eip, uint8_t flags)
 	if (!(flags & 1)) {
 		// NOTE: is_phys can only be set if TLB_WATCH is not set
 		cpu_check_data_watchpoints(cpu, addr, sizeof(T), DR7_TYPE_DATA_RW, eip);
-		if ((addr & ~PAGE_MASK) != ((addr + sizeof(T) - 1) & ~PAGE_MASK)) {
+		if ((sizeof(T) != 1) && ((addr & ~PAGE_MASK) != ((addr + sizeof(T) - 1) & ~PAGE_MASK))) {
 			T value = 0;
 			uint8_t i = 0;
 			addr_t phys_addr_s = get_read_addr(cpu, addr, flags & 2, eip);
@@ -263,50 +255,45 @@ T mem_read(cpu_t *cpu, addr_t addr, uint32_t eip, uint8_t flags)
 }
 
 template<typename T>
-void mem_write(cpu_t *cpu, addr_t addr, T value, uint32_t eip, uint8_t flags, translated_code_t *tc)
+void mem_write(cpu_t *cpu, addr_t addr, T value, uint32_t eip, uint8_t flags)
 {
-	if (!(flags & 1)) {
-		// NOTE: is_phys can only be set if TLB_WATCH is not set
-		cpu_check_data_watchpoints(cpu, addr, sizeof(T), DR7_TYPE_DATA_W, eip);
-		if ((addr & ~PAGE_MASK) != ((addr + sizeof(T) - 1) & ~PAGE_MASK)) {
-			uint8_t is_code1, is_code2;
-			uint8_t i = 0;
-			int8_t j = sizeof(T) - 1;
-			addr_t phys_addr_s = get_write_addr(cpu, addr, flags & 2, eip, &is_code1);
-			addr_t phys_addr_e = get_write_addr(cpu, addr + sizeof(T) - 1, flags & 2, eip, &is_code2);
-			addr_t phys_addr = phys_addr_s;
-			uint8_t bytes_in_page = ((addr + sizeof(T) - 1) & ~PAGE_MASK) - addr;
-			if (is_code1) {
-				tc_invalidate(&cpu->cpu_ctx, tc, phys_addr_s, bytes_in_page, eip);
-			}
-			if (is_code2) {
-				tc_invalidate(&cpu->cpu_ctx, tc, phys_addr_e & ~PAGE_MASK, sizeof(T) - bytes_in_page, eip);
-			}
-			if constexpr (is_big_endian) {
-				sys::swapByteOrder<T>(value);
-			}
-			while (i < sizeof(T)) {
-				memory_region_t<addr_t> *region = as_memory_search_addr<T>(cpu, phys_addr);
-				as_memory_dispatch_write<uint8_t>(cpu, phys_addr, value >> (j * 8), region);
-				phys_addr++;
-				i++;
-				j--;
-				if (i == bytes_in_page) {
-					phys_addr = phys_addr_e & ~PAGE_MASK;
-				}
-			}
+	// NOTE: is_phys is never set because tc_invalidate needs a virtual address
+	cpu_check_data_watchpoints(cpu, addr, sizeof(T), DR7_TYPE_DATA_W, eip);
+	if ((sizeof(T) != 1) && ((addr & ~PAGE_MASK) != ((addr + sizeof(T) - 1) & ~PAGE_MASK))) {
+		uint8_t is_code1, is_code2;
+		uint8_t i = 0;
+		int8_t j = sizeof(T) - 1;
+		addr_t phys_addr_s = get_write_addr(cpu, addr, flags & 2, eip, &is_code1);
+		addr_t phys_addr_e = get_write_addr(cpu, addr + sizeof(T) - 1, flags & 2, eip, &is_code2);
+		addr_t phys_addr = phys_addr_s;
+		uint8_t bytes_in_page = ((addr + sizeof(T) - 1) & ~PAGE_MASK) - addr;
+		if (is_code1) {
+			tc_invalidate(&cpu->cpu_ctx, addr, bytes_in_page, eip);
 		}
-		else {
-			uint8_t is_code;
-			addr_t phys_addr = get_write_addr(cpu, addr, flags & 2, eip, &is_code);
-			if (is_code) {
-				tc_invalidate(&cpu->cpu_ctx, tc, phys_addr, sizeof(T), eip);
+		if (is_code2) {
+			tc_invalidate(&cpu->cpu_ctx, addr + sizeof(T) - 1, sizeof(T) - bytes_in_page, eip);
+		}
+		if constexpr (is_big_endian) {
+			sys::swapByteOrder<T>(value);
+		}
+		while (i < sizeof(T)) {
+			memory_region_t<addr_t> *region = as_memory_search_addr<T>(cpu, phys_addr);
+			as_memory_dispatch_write<uint8_t>(cpu, phys_addr, value >> (j * 8), region);
+			phys_addr++;
+			i++;
+			j--;
+			if (i == bytes_in_page) {
+				phys_addr = phys_addr_e & ~PAGE_MASK;
 			}
-			as_memory_dispatch_write<T>(cpu, phys_addr, value, as_memory_search_addr<T>(cpu, phys_addr));
 		}
 	}
 	else {
-		as_memory_dispatch_write<T>(cpu, addr, value, as_memory_search_addr<T>(cpu, addr));
+		uint8_t is_code;
+		addr_t phys_addr = get_write_addr(cpu, addr, flags & 2, eip, &is_code);
+		if (is_code) {
+			tc_invalidate(&cpu->cpu_ctx, addr, sizeof(T), eip);
+		}
+		as_memory_dispatch_write<T>(cpu, phys_addr, value, as_memory_search_addr<T>(cpu, phys_addr));
 	}
 }
 
@@ -316,11 +303,15 @@ void mem_write(cpu_t *cpu, addr_t addr, T value, uint32_t eip, uint8_t flags, tr
 template<typename T>
 T io_read(cpu_t *cpu, port_t port)
 {
-	return as_io_dispatch_read<T>(cpu, port, as_io_search_port<T>(cpu, port));
+	const auto region = as_io_search_port<T>(cpu, port);
+	iotlb_fill(cpu, port, region);
+	return as_io_dispatch_read<T>(cpu, port, region);
 }
 
 template<typename T>
 void io_write(cpu_t *cpu, port_t port, T value)
 {
-	as_io_dispatch_write<T>(cpu, port, value, as_io_search_port<T>(cpu, port));
+	const auto region = as_io_search_port<T>(cpu, port);
+	iotlb_fill(cpu, port, region);
+	as_io_dispatch_write<T>(cpu, port, value, region);
 }

@@ -49,19 +49,13 @@ static regs_t *regs = nullptr;
 
 
 static void
-dbg_write_handler(addr_t addr, size_t size, const uint64_t value, void *opaque)
+dbg_write_handler(addr_t addr, const uint8_t value, void *opaque)
 {
 	switch (addr)
 	{
-	case DBG_POST_PORT: {
-		if (size == 1) {
-			std::printf("Test number is 0x%X\n", static_cast<const uint8_t>(value));
-		}
-		else {
-			std::printf("Unhandled i/o port size at port %d\n", DBG_POST_PORT);
-		}
-	}
-	break;
+	case DBG_POST_PORT:
+		std::printf("Test number is 0x%X\n", value);
+		break;
 
 	default:
 		std::printf("Unhandled i/o write at port %d\n", addr);
@@ -110,12 +104,12 @@ int_handler_printer()
 		break;
 
 	case 0x107D:
-		val = regs->dr6;
+		val = regs->dr[6];
 		std::printf("general detect read at 0x%X: dr6 should have bd flag set, it actually was %d\n", eip, (val >> 13) & 1);
 		break;
 
 	case 0x1088:
-		val = regs->dr6;
+		val = regs->dr[6];
 		std::printf("general detect write at 0x%X: dr6 should have bd flag set, it actually was %d\n", eip, (val >> 13) & 1);
 		break;
 
@@ -142,7 +136,7 @@ int_handler_printer()
 		break;
 
 	default:
-		std::printf("got unexpected eip with value 0x%X", eip);
+		std::printf("got unexpected eip with value 0x%X\n", eip);
 	}
 
 	regs->eip = ret_eip;
@@ -154,25 +148,26 @@ gen_dbg_test()
 {
 	size_t ramsize = 1024 * 1024;
 
-	if (!LIB86CPU_CHECK_SUCCESS(cpu_new(ramsize, cpu))) {
+	if (!LC86_SUCCESS(cpu_new(ramsize, cpu))) {
 		printf("Failed to initialize lib86cpu!\n");
 		return false;
 	}
 
+	cpu_set_a20(cpu, true);
 	uint8_t *ram = get_ram_ptr(cpu);
 	std::memcpy(ram + 0x1000, dbg_binary, sizeof(dbg_binary));
 
-	if (!LIB86CPU_CHECK_SUCCESS(mem_init_region_ram(cpu, 0, ramsize, 1))) {
+	if (!LC86_SUCCESS(mem_init_region_ram(cpu, 0, ramsize))) {
 		std::printf("Failed to initialize ram memory!\n");
 		return false;
 	}
 
-	if (!LIB86CPU_CHECK_SUCCESS(mem_init_region_io(cpu, DBG_POST_PORT - 3, 4, true, nullptr, dbg_write_handler, nullptr, 1))) {
+	if (!LC86_SUCCESS(mem_init_region_io(cpu, DBG_POST_PORT, 1, true, io_handlers_t{ .fnw8 = dbg_write_handler }, nullptr))) {
 		std::printf("Failed to initialize post i/o port for debug test!\n");
 		return false;
 	}
 
-	if (!LIB86CPU_CHECK_SUCCESS(hook_add(cpu, 0x110C, std::unique_ptr<hook>(new hook({ {}, {}, "int_handler_printer", int_handler_printer }))))) {
+	if (!LC86_SUCCESS(hook_add(cpu, 0x110C, &int_handler_printer))) {
 		std::printf("Failed to install hook!\n");
 		return false;
 	}
@@ -251,7 +246,7 @@ gen_dbg_test()
 
 	regs->cr0 = 0x80000001; // protected, paging
 	regs->cr3 = 0x000FF000;
-	regs->cr4 = 0x8; // debug extensions
+	regs->cr4 = 0x0; // don't enable debug extensions because io watchpoints are not supported yet
 
 	return true;
 }

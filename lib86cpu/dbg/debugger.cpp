@@ -5,7 +5,6 @@
  */
 
 #include "memory.h"
-#include "frontend.h"
 #include "debugger.h"
 #include "instructions.h"
 #include <fstream>
@@ -307,10 +306,8 @@ dbg_add_exp_hook(cpu_ctx_t *cpu_ctx)
 		return;
 	}
 
-	hook_add(cpu_ctx->cpu, cpu_ctx->cpu->bp_addr, std::unique_ptr<hook>(new hook({ std::vector<arg_types> { arg_types::ptr },
-	std::vector<uint64_t> { reinterpret_cast<uintptr_t>(cpu_ctx) }, "dbg_exp_handler", &dbg_exp_handler })));
-	hook_add(cpu_ctx->cpu, cpu_ctx->cpu->db_addr, std::unique_ptr<hook>(new hook({ std::vector<arg_types> { arg_types::ptr },
-	std::vector<uint64_t> { reinterpret_cast<uintptr_t>(cpu_ctx) }, "dbg_exp_handler", &dbg_exp_handler })));
+	hook_add(cpu_ctx->cpu, cpu_ctx->cpu->bp_addr, &dbg_exp_handler);
+	hook_add(cpu_ctx->cpu, cpu_ctx->cpu->db_addr, &dbg_exp_handler);
 }
 
 static std::vector<std::pair<addr_t, std::string>>
@@ -381,7 +378,7 @@ void
 dbg_ram_read(cpu_t *cpu, uint8_t *buff)
 {
 	size_t actual_size;
-	if (!LIB86CPU_CHECK_SUCCESS(mem_read_block(cpu, mem_pc, PAGE_SIZE, buff, &actual_size))) {
+	if (!LC86_SUCCESS(mem_read_block(cpu, mem_pc, PAGE_SIZE, buff, &actual_size))) {
 		std::memset(&buff[actual_size], 0, PAGE_SIZE - actual_size);
 	}
 }
@@ -400,13 +397,13 @@ dbg_ram_write(uint8_t *data, size_t off, uint8_t val)
 	try {
 		uint8_t is_code;
 		addr_t phys_addr = get_write_addr(g_cpu, addr, 2, addr - g_cpu->cpu_ctx.regs.cs_hidden.base, &is_code);
-		memory_region_t<addr_t> *region = as_memory_search_addr<uint8_t>(g_cpu, phys_addr);
+		const memory_region_t<addr_t> *region = as_memory_search_addr(g_cpu, phys_addr);
 
 		retry:
 		switch (region->type)
 		{
 		case mem_type::ram:
-			ram_write<uint8_t>(g_cpu, get_ram_host_ptr(g_cpu, region, phys_addr), val);
+			ram_write<uint8_t>(g_cpu, get_ram_host_ptr(g_cpu, phys_addr), val);
 			if (is_code) {
 				tc_invalidate(&g_cpu->cpu_ctx, addr, 1, g_cpu->cpu_ctx.regs.eip);
 			}
@@ -418,7 +415,7 @@ dbg_ram_write(uint8_t *data, size_t off, uint8_t val)
 			break;
 
 		case mem_type::alias: {
-			memory_region_t<addr_t> *alias = region;
+			const memory_region_t<addr_t> *alias = region;
 			AS_RESOLVE_ALIAS();
 			phys_addr = region->start + alias_offset + (phys_addr - alias->start);
 			goto retry;
@@ -456,18 +453,18 @@ dbg_single_step_handler(cpu_ctx_t *cpu_ctx)
 		guest_running.notify_one();
 		guest_running.wait(false);
 
-		cpu_ctx->regs.dr6 &= ~DR6_BS_MASK;
+		cpu_ctx->regs.dr[6] &= ~DR6_BS_MASK;
 
 		try {
 			// execute an iret instruction so that we can correctly return to the interrupted code
 			if	(cpu_ctx->hflags & HFLG_PE_MODE) {
-				if (lret_pe_helper<true>(cpu_ctx, ((cpu_ctx->hflags & HFLG_CS32) >> CS32_SHIFT) ^ 1, cpu_ctx->regs.eip)) {
+				if (lret_pe_helper<true>(cpu_ctx, (cpu_ctx->hflags & HFLG_CS32) ? SIZE32 : SIZE16, cpu_ctx->regs.eip)) {
 					// we can't handle an exception here, so abort
 					LIB86CPU_ABORT_msg("Unhandled exception while returning from a single step");
 				}
 			}
 			else {
-				iret_real_helper(cpu_ctx, ((cpu_ctx->hflags & HFLG_CS32) >> CS32_SHIFT) ^ 1, cpu_ctx->regs.eip);
+				iret_real_helper(cpu_ctx, (cpu_ctx->hflags & HFLG_CS32) ? SIZE32 : SIZE16, cpu_ctx->regs.eip);
 			}
 		}
 		catch (host_exp_t type) {
@@ -503,13 +500,13 @@ dbg_sw_breakpoint_handler(cpu_ctx_t *cpu_ctx)
 		try {
 			// execute an iret instruction so that we can correctly return to the interrupted code
 			if (cpu_ctx->hflags & HFLG_PE_MODE) {
-				if (lret_pe_helper<true>(cpu_ctx, ((cpu_ctx->hflags & HFLG_CS32) >> CS32_SHIFT) ^ 1, cpu_ctx->regs.eip)) {
+				if (lret_pe_helper<true>(cpu_ctx, (cpu_ctx->hflags & HFLG_CS32) ? SIZE32 : SIZE16, cpu_ctx->regs.eip)) {
 					// we can't handle an exception here, so abort
 					LIB86CPU_ABORT_msg("Unhandled exception while returning from a breakpoint");
 				}
 			}
 			else {
-				iret_real_helper(cpu_ctx, ((cpu_ctx->hflags & HFLG_CS32) >> CS32_SHIFT) ^ 1, cpu_ctx->regs.eip);
+				iret_real_helper(cpu_ctx, (cpu_ctx->hflags & HFLG_CS32) ? SIZE32 : SIZE16, cpu_ctx->regs.eip);
 			}
 			cpu_ctx->regs.eip = ret_eip - 1;
 		}
@@ -528,7 +525,7 @@ void
 dbg_exp_handler(cpu_ctx_t *cpu_ctx)
 {
 	// NOTE: the guest could be using the same exception handler for both DB and BP exceptions, so we distinguish them by looking at dr6
-	if (cpu_ctx->regs.dr6 & DR6_BS_MASK) {
+	if (cpu_ctx->regs.dr[6] & DR6_BS_MASK) {
 		dbg_single_step_handler(cpu_ctx);
 	}
 	else {

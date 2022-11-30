@@ -6,21 +6,19 @@
 
 #pragma once
 
-#define DEFINE_REG32(_reg)			\
+#define DEFINE_REG32(_reg) \
 		uint32_t		_reg
 
-#define DEFINE_REG16(_reg)			\
+#define DEFINE_REG16(_reg) \
 		uint16_t		_reg
 
-#define DEFINE_SEG_REG(_reg)			\
-	struct {				\
-		uint16_t		_reg;	\
+#define DEFINE_SEG_REG(_reg) \
+		uint16_t		_reg; \
 		struct { \
 			uint32_t base; \
 			uint32_t limit; \
 			uint32_t flags; \
-		} _reg ## _hidden; \
-	}
+		} _reg ## _hidden;
 
 #define DEFINE_FP80(_reg) \
 	PACKED(struct { \
@@ -28,7 +26,6 @@
 		uint16_t high; \
 	} _reg;)
 
-// These registers must have the same order they have in cpu->regs_layout
 struct regs_t {
 	/* General registers */
 	DEFINE_REG32(eax);
@@ -58,14 +55,7 @@ struct regs_t {
 	DEFINE_REG32(cr4);
 
 	/* Debug registers */
-	DEFINE_REG32(dr0);
-	DEFINE_REG32(dr1);
-	DEFINE_REG32(dr2);
-	DEFINE_REG32(dr3);
-	DEFINE_REG32(dr4);
-	DEFINE_REG32(dr5);
-	DEFINE_REG32(dr6);
-	DEFINE_REG32(dr7);
+	uint32_t dr[8];
 
 	DEFINE_REG32(eflags);
 	DEFINE_REG32(eip);

@@ -43,17 +43,11 @@ lc86status_to_str(lc86_status status)
 	case lc86_status::invalid_parameter:
 		return "An invalid parameter was specified";
 
-	case lc86_status::already_exist:
-		return "The specified object already exists";
-
 	case lc86_status::not_found:
 		return "The specified object could not be found";
 
 	case lc86_status::guest_exp:
 		return "A guest exception was raised by lib86cpu while executing the operation";
-
-	case lc86_status::too_many:
-		return "Maximum allowed number of objects exceeded";
 
 	case lc86_status::success:
 		return "The operation completed successfully";

@@ -33,6 +33,13 @@ enum class mem_type {
 	rom,
 };
 
+enum class host_exp_t : int {
+	pf_exp,
+	de_exp,
+	cpu_mode_changed,
+	halt_tc,
+};
+
 template<typename T>
 struct memory_region_t {
 	T start;
@@ -42,9 +49,10 @@ struct memory_region_t {
 	void *opaque;
 	addr_t alias_offset;
 	memory_region_t<T> *aliased_region;
-	int rom_idx;
+	uint8_t *rom_ptr;
 	memory_region_t() : start(0), end(0), alias_offset(0), type(mem_type::unmapped), handlers{},
-		opaque(nullptr), aliased_region(nullptr), rom_idx(-1) {};
+		opaque(nullptr), aliased_region(nullptr), rom_ptr(nullptr) {};
+	memory_region_t(T s, T e) : memory_region_t() { start = s; end = e; }
 };
 
 #include "as.h"
@@ -56,9 +64,7 @@ struct memory_region_t {
 // 2: holds the phys addr of the page and points to a PAGE_SIZE array of indices used to find the region addr refers to
 struct subpage_t {
 	addr_t phys_addr;
-	uint16_t *cached_region_idx;
-	subpage_t() : phys_addr(0), cached_region_idx(nullptr) {}
-	~subpage_t() { delete[] cached_region_idx; }
+	std::unique_ptr<uint16_t[]> cached_region_idx;
 };
 
 struct exp_data_t {
@@ -75,19 +81,20 @@ struct exp_info_t {
 
 struct cpu_ctx_t;
 struct translated_code_t;
-using entry_t = translated_code_t * (*)(cpu_ctx_t *cpu_ctx);
-using raise_int_t = void (*)(cpu_ctx_t *cpu_ctx, uint8_t int_flg);
-using iret_t = entry_t; // could just return void
+using entry_t = translated_code_t *(*)(cpu_ctx_t *cpu_ctx);
+using read_int_t = uint32_t (*)(cpu_ctx_t *cpu_ctx);
+using clear_int_t = void (*)(cpu_ctx_t *cpu_ctx);
+using raise_int_t = void (*)(cpu_ctx_t *cpu_ctx, uint32_t int_flg);
 
-// jmp_offset functions: 0,1 -> used for direct linking (either points to exit or &next_tc), 2 -> exit, 3 -> dbg int, 4 -> hw int
+// jmp_offset functions: 0,1 -> used for direct linking (either points to exit or &next_tc), 2 -> exit
 struct translated_code_t {
 	std::forward_list<translated_code_t *> linked_tc;
 	addr_t cs_base;
 	addr_t pc;
 	addr_t virt_pc;
-	uint32_t cpu_flags;
+	uint32_t guest_flags;
 	entry_t ptr_code;
-	entry_t jmp_offset[5];
+	entry_t jmp_offset[3];
 	uint32_t flags;
 	uint32_t size;
 	explicit translated_code_t() noexcept;
@@ -119,8 +126,13 @@ struct cpu_ctx_t {
 	uint32_t tlb[TLB_MAX_SIZE];
 	uint8_t *ram;
 	exp_info_t exp_info;
-	uint8_t int_pending;
+	uint32_t int_pending;
+	uint8_t exit_requested;
+	uint8_t is_halted;
 };
+
+// int_pending must be 4 byte aligned to ensure atomicity
+static_assert(alignof(decltype(cpu_ctx_t::int_pending)) == 4);
 
 class lc86_jit;
 struct cpu_t {
@@ -135,32 +147,38 @@ struct cpu_t {
 	std::unordered_map<uint32_t, std::unordered_set<translated_code_t *>> tc_page_map;
 	std::unordered_map<addr_t, translated_code_t *> ibtc;
 	std::unordered_map<addr_t, void *> hook_map;
-	std::vector<uint8_t *> vec_rom;
 	std::vector<subpage_t> subpages;
+	std::vector<std::pair<bool, std::unique_ptr<memory_region_t<addr_t>>>> regions_changed;
 	std::vector<const memory_region_t<addr_t> *> cached_regions;
 	std::bitset<std::numeric_limits<port_t>::max() + 1> iotable;
 	uint16_t num_tc;
 	struct {
 		uint64_t tsc;
-		static constexpr uint64_t freq = 733333333;
+		static constexpr uint64_t cpu_freq = 733333333;
 		uint64_t last_host_ticks;
-		uint64_t host_freq;
-	} clock;
+	} tsc_clock;
 	struct {
-		struct {
-			uint64_t base;
-			uint64_t mask;
-		} phys_var[8];
-	} mtrr;
-	raise_int_t int_fn;
+		uint64_t last_time;
+		uint64_t tot_time_us;
+		uint64_t host_freq;
+		uint64_t timeout_time;
+	} timer;
+	msr_t msr;
+	read_int_t read_int_fn;
+	clear_int_t clear_int_fn;
+	raise_int_t raise_int_fn;
+	clear_int_t lower_hw_int_fn;
+	fp_int get_int_vec;
 	std::string dbg_name;
 	addr_t bp_addr;
 	addr_t db_addr;
 	addr_t instr_eip;
 	addr_t virt_pc;
+	addr_t ram_start;
 	size_t instr_bytes;
 	uint8_t size_mode;
 	uint8_t addr_mode;
 	uint8_t translate_next;
 	uint32_t a20_mask;
+	uint32_t new_a20;
 };

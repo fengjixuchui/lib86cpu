@@ -10,6 +10,7 @@
 #include "endianness.h"
 
 
+// these flags are ORed with the flags in lib86cpu.h, so avoid coflicts
 #define CPU_DISAS_ONE           (1 << 7)
 #define CPU_ALLOW_CODE_WRITE    (1 << 8)
 #define CPU_FORCE_INSERT        (1 << 9)
@@ -44,6 +45,7 @@ private:
 };
 
 void cpu_reset(cpu_t *cpu);
+template<bool run_forever>
 lc86_status cpu_start(cpu_t *cpu);
 [[noreturn]] void cpu_runtime_abort(const char *msg);
 [[noreturn]] void cpu_abort(int32_t code, const char *msg, ...);

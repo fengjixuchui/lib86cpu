@@ -31,6 +31,7 @@ public:
 	void gen_code_block();
 	void gen_tc_prologue() { start_new_session(); gen_prologue_main(); }
 	void gen_tc_epilogue();
+	void gen_int_fn();
 	void hook_emit(void *hook_addr);
 	void raise_exp_inline_emit(uint32_t fault_addr, uint16_t code, uint16_t idx, uint32_t eip);
 	void free_code_block(void *addr) { m_mem.release_sys_mem(addr); }
@@ -61,6 +62,7 @@ public:
 	void cmovcc(ZydisDecodedInstruction *instr);
 	void cmp(ZydisDecodedInstruction *instr);
 	void cmps(ZydisDecodedInstruction *instr);
+	void cpuid(ZydisDecodedInstruction *instr);
 	void cwd(ZydisDecodedInstruction *instr);
 	void cwde(ZydisDecodedInstruction *instr);
 	void daa(ZydisDecodedInstruction *instr);
@@ -72,7 +74,9 @@ public:
 	void imul(ZydisDecodedInstruction *instr);
 	void in(ZydisDecodedInstruction *instr);
 	void inc(ZydisDecodedInstruction *instr);
+	void ins(ZydisDecodedInstruction *instr);
 	void int3(ZydisDecodedInstruction *instr);
+	void intn(ZydisDecodedInstruction *instr);
 	void iret(ZydisDecodedInstruction *instr);
 	void jcc(ZydisDecodedInstruction *instr);
 	void jmp(ZydisDecodedInstruction *instr);
@@ -107,6 +111,7 @@ public:
 	void pushf(ZydisDecodedInstruction *instr);
 	void rcl(ZydisDecodedInstruction *instr);
 	void rcr(ZydisDecodedInstruction *instr);
+	void rdmsr(ZydisDecodedInstruction *instr);
 	void rdtsc(ZydisDecodedInstruction *instr);
 	void ret(ZydisDecodedInstruction *instr);
 	void rol(ZydisDecodedInstruction *instr);
@@ -128,6 +133,8 @@ public:
 	void test(ZydisDecodedInstruction *instr);
 	void verr(ZydisDecodedInstruction *instr);
 	void verw(ZydisDecodedInstruction *instr);
+	void wbinvd(ZydisDecodedInstruction *instr);
+	void wrmsr(ZydisDecodedInstruction *instr);
 	void xchg(ZydisDecodedInstruction *instr);
 	void xor_(ZydisDecodedInstruction *instr);
 
@@ -146,7 +153,10 @@ private:
 	template<bool set_ret = true>
 	void gen_epilogue_main();
 	void gen_tail_call(x86::Gp addr);
+	template<unsigned idx>
 	void gen_int_fn();
+	void gen_timeout_check();
+	void gen_no_link_checks();
 	void check_int_emit();
 	bool check_rf_single_step_emit();
 	template<typename T>
@@ -228,6 +238,8 @@ private:
 	void lxs(ZydisDecodedInstruction *instr);
 	template<unsigned idx>
 	void bit(ZydisDecodedInstruction *instr);
+	template<unsigned idx>
+	void int_(ZydisDecodedInstruction *instr);
 
 	cpu_t *m_cpu;
 	CodeHolder m_code;

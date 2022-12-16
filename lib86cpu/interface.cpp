@@ -104,6 +104,13 @@ default_pmio_write_handler32(addr_t addr, const uint32_t value, void *opaque)
 	LOG(log_level::warn, "Unhandled PMIO write at port %#06x", addr);
 }
 
+static uint16_t
+default_get_int_vec()
+{
+	LOG(log_level::warn, "Unexpected hardware interrupt");
+	return EXP_INVALID;
+}
+
 // NOTE: lib86cpu runs entirely on the single thread that calls cpu_run, so calling the below functions from other threads is not safe. Only call them
 // from the hook, mmio or pmio callbacks or before the emulation starts.
 
@@ -111,11 +118,12 @@ default_pmio_write_handler32(addr_t addr, const uint32_t value, void *opaque)
 * cpu_new -> creates a new cpu instance. Only a single instance should exist at a time
 * ramsize: size in bytes of ram buffer internally created (must be a multiple of 4096)
 * out: returned cpu instance
+* (optional) int_fn: function that returns the vector number when a hw interrupt is serviced. Not necessary if you never generate hw interrupts
 * (optional) debuggee: name of the debuggee program to run
 * ret: the status of the operation
 */
 lc86_status
-cpu_new(size_t ramsize, cpu_t *&out, const char *debuggee)
+cpu_new(uint32_t ramsize, cpu_t *&out, fp_int int_fn, const char *debuggee)
 {
 	LOG(log_level::info, "Creating new cpu...");
 
@@ -130,17 +138,19 @@ cpu_new(size_t ramsize, cpu_t *&out, const char *debuggee)
 		return set_last_error(lc86_status::invalid_parameter);
 	}
 
-	cpu->cpu_ctx.ram = new uint8_t[ramsize];
+	// allocate 8 extra bytes at then end in the case something ever does a 2,4,8 byte access on the last valid byte of ram
+	cpu->cpu_ctx.ram = new uint8_t[ramsize + 8];
 	if (cpu->cpu_ctx.ram == nullptr) {
 		cpu_free(cpu);
 		return set_last_error(lc86_status::no_memory);
 	}
 
-	cpu->cpu_name = "Intel Pentium III";
+	cpu->cpu_name = "Intel Pentium III KC 733 (Xbox CPU)";
 	cpu_reset(cpu);
 	// XXX: eventually, the user should be able to set the instruction formatting
 	set_instr_format(cpu);
 	cpu->dbg_name = debuggee ? debuggee : "";
+	cpu->get_int_vec = int_fn ? int_fn : default_get_int_vec;
 
 	cpu->memory_space_tree = address_space<addr_t>::create();
 	cpu->io_space_tree = address_space<port_t>::create();
@@ -162,7 +172,7 @@ cpu_new(size_t ramsize, cpu_t *&out, const char *debuggee)
 }
 
 /*
-* cpu_free -> destroys a cpu instance. Only call this after cpu_run has returned
+* cpu_free -> destroys a cpu instance. Only call this after cpu_run/cpu_run_until has returned
 * cpu: a valid cpu instance
 * ret: nothing
 */
@@ -180,36 +190,31 @@ cpu_free(cpu_t *cpu)
 	delete cpu;
 }
 
-/*
-* cpu_run -> starts the emulation. Only returns when there is an error in lib86cpu
-* cpu: a valid cpu instance
-* ret: the exit reason
-*/
-lc86_status
-cpu_run(cpu_t *cpu)
+template<bool should_purge>
+static void cpu_sync_state(cpu_t *cpu)
 {
-	cpu_sync_state(cpu);
-	return cpu_start(cpu);
-}
+	// only flush the tlb and the code cache if the cpu mode changed
+	if ((cpu->cpu_ctx.regs.cr0 & CR0_PE_MASK) != ((cpu->cpu_ctx.hflags & HFLG_PE_MODE) >> PE_MODE_SHIFT)) {
+		tlb_flush(cpu, TLB_zero);
+		if constexpr (should_purge) {
+			tc_cache_purge(cpu);
+		}
+		else {
+			tc_cache_clear(cpu);
+		}
+	}
 
-/*
-* cpu_sync_state -> synchronizes internal cpu flags with the current cpu state. Only call this before cpu_run
-* cpu: a valid cpu instance
-* ret: nothing
-*/
-void
-cpu_sync_state(cpu_t *cpu)
-{
-	tlb_flush(cpu, TLB_zero);
+	// there's no need to sync HFLG_TRAMP, HFLG_DBG_TRAP and HFLG_TIMEOUT since those can never be set when this is called either from the client or from cpu_run
 	cpu->cpu_ctx.hflags = 0;
+	cpu->cpu_ctx.hflags |= (cpu->cpu_ctx.regs.cs & HFLG_CPL);
+	if (cpu->cpu_ctx.regs.cs_hidden.flags & SEG_HIDDEN_DB) {
+		cpu->cpu_ctx.hflags |= HFLG_CS32;
+	}
+	if (cpu->cpu_ctx.regs.ss_hidden.flags & SEG_HIDDEN_DB) {
+		cpu->cpu_ctx.hflags |= HFLG_SS32;
+	}
 	if (cpu->cpu_ctx.regs.cr0 & CR0_PE_MASK) {
-		cpu->cpu_ctx.hflags |= ((cpu->cpu_ctx.regs.cs & HFLG_CPL) | HFLG_PE_MODE);
-		if (cpu->cpu_ctx.regs.cs_hidden.flags & SEG_HIDDEN_DB) {
-			cpu->cpu_ctx.hflags |= HFLG_CS32;
-		}
-		if (cpu->cpu_ctx.regs.ss_hidden.flags & SEG_HIDDEN_DB) {
-			cpu->cpu_ctx.hflags |= HFLG_SS32;
-		}
+		cpu->cpu_ctx.hflags |= HFLG_PE_MODE;
 	}
 	if (cpu->cpu_ctx.regs.cr0 & CR0_EM_MASK) {
 		cpu->cpu_ctx.hflags |= HFLG_CR0_EM;
@@ -217,18 +222,84 @@ cpu_sync_state(cpu_t *cpu)
 }
 
 /*
-* cpu_set_flags -> sets lib86cpu flags with the current cpu state. Only call this before cpu_run
+* cpu_run -> starts the emulation. Only returns when there is an error in lib86cpu, cpu_sync_state internally called
 * cpu: a valid cpu instance
+* ret: the exit reason
+*/
+lc86_status
+cpu_run(cpu_t *cpu)
+{
+	cpu_sync_state<true>(cpu);
+	return cpu_start<true>(cpu);
+}
+
+/*
+* cpu_run -> starts the emulation. Returns when (1) there is an error in lib86cpu (2) the timeout time has been reached. cpu_sync_state not internally called
+* cpu: a valid cpu instance
+* timeout_time: a timeout in microseconds representing the time slice to run before returning
+* ret: the exit reason
+*/
+lc86_status
+cpu_run_until(cpu_t *cpu, uint64_t timeout_time)
+{
+	cpu->timer.timeout_time = timeout_time;
+	return cpu_start<false>(cpu);
+}
+
+/*
+* cpu_run -> changes the timeout time currently set
+* cpu: a valid cpu instance
+* timeout_time: a timeout in microseconds representing the time slice to run before returning
+* ret: the exit reason
+*/
+void
+cpu_set_timeout(cpu_t *cpu, uint64_t timeout_time)
+{
+	cpu->timer.timeout_time = timeout_time;
+}
+
+/*
+* cpu_exit->submit to the cpu a request to terminate the emulation(this function is multi - thread safe)
+* cpu: a valid cpu instance
+* ret: nothing
+*/
+void
+cpu_exit(cpu_t *cpu)
+{
+	cpu->raise_int_fn(&cpu->cpu_ctx, CPU_ABORT_INT);
+}
+
+/*
+* cpu_sync_state -> synchronizes internal cpu flags with the current cpu state. This is necessary to call when cr0, cs, cs_flags and ss_flags have changed.
+* Only call while the emulation is not running
+* cpu: a valid cpu instance
+* ret: nothing
+*/
+void
+cpu_sync_state(cpu_t *cpu)
+{
+	cpu_sync_state<false>(cpu);
+}
+
+/*
+* cpu_set_flags -> sets lib86cpu flags with the current cpu state. Only call this while the emulation is not running
+* cpu: a valid cpu instance
+* flags: the flags to set
 * ret: the status of the operation
 */
 lc86_status
 cpu_set_flags(cpu_t *cpu, uint32_t flags)
 {
-	if (flags & ~(CPU_INTEL_SYNTAX | CPU_DBG_PRESENT)) {
+	if (flags & ~(CPU_INTEL_SYNTAX | CPU_DBG_PRESENT | CPU_ABORT_ON_HLT)) {
 		return set_last_error(lc86_status::invalid_parameter);
 	}
 
-	cpu->cpu_flags &= ~(CPU_INTEL_SYNTAX | CPU_DBG_PRESENT);
+	if ((cpu->cpu_flags & (CPU_DBG_PRESENT | CPU_ABORT_ON_HLT)) != (flags & (CPU_DBG_PRESENT | CPU_ABORT_ON_HLT))) {
+		// CPU_DBG_PRESENT and CPU_ABORT_ON_HLT change the code emitted for lidt and hlt respectively, so we need to flush the cache if those changed
+		tc_cache_clear(cpu);
+	}
+
+	cpu->cpu_flags &= ~(CPU_INTEL_SYNTAX | CPU_DBG_PRESENT | CPU_ABORT_ON_HLT);
 	cpu->cpu_flags |= flags;
 	// XXX: eventually, the user should be able to set the instruction formatting
 	set_instr_format(cpu);
@@ -236,28 +307,53 @@ cpu_set_flags(cpu_t *cpu, uint32_t flags)
 	return lc86_status::success;
 }
 
-// NOTE: this functions will throw a host_exp_t::a20_changed exception when the gate status changes. See the memory API exception NOTE2 for more details.
+// NOTE: this function uses should_int in the same manner as the memory APIs when when the gate status changes.
 
 /*
-* cpu_set_a20 -> open or close the a20 gate of the cpu (can throw an exception)
+* cpu_set_a20 -> open or close the a20 gate of the cpu
 * cpu: a valid cpu instance
 * closed: new gate status. If true then addresses are masked with 0xFFFFFFFF (gate closed), otherwise they are masked with 0xFFEFFFFF (gate open)
-* should_throw: suppresses the exception when false, otherwise can throw
+* should_int: raises a guest interrupt when true, otherwise the change takes effect immediately
 * ret: nothing
 */
 void
-cpu_set_a20(cpu_t *cpu, bool closed, bool should_throw)
+cpu_set_a20(cpu_t *cpu, bool closed, bool should_int)
 {
 	uint32_t old_a20_mask = cpu->a20_mask;
-	cpu->a20_mask = 0xFFFFFFFF ^ (!closed << 20);
-	if (old_a20_mask != cpu->a20_mask) {
-		tlb_flush(cpu, TLB_zero);
-		cpu->cached_regions.clear();
-		cpu->cached_regions.push_back(nullptr);
-		if (should_throw) {
-			throw host_exp_t::a20_changed;
+	cpu->new_a20 = 0xFFFFFFFF ^ (!closed << 20);
+	if (old_a20_mask != cpu->new_a20) {
+		if (should_int) {
+			cpu->raise_int_fn(&cpu->cpu_ctx, CPU_A20_INT);
+		}
+		else {
+			cpu->a20_mask = cpu->new_a20;
+			tlb_flush(cpu, TLB_zero);
+			cpu->cached_regions.clear();
+			cpu->cached_regions.push_back(nullptr);
 		}
 	}
+}
+
+/*
+* cpu_raise_hw_int -> raises the hardware interrupt line (this function is multi-thread safe)
+* cpu: a valid cpu instance
+* ret: nothing
+*/
+void
+cpu_raise_hw_int_line(cpu_t *cpu)
+{
+	cpu->raise_int_fn(&cpu->cpu_ctx, CPU_HW_INT);
+}
+
+/*
+* cpu_raise_hw_int -> lowers the hardware interrupt line (this function is multi-thread safe)
+* cpu: a valid cpu instance
+* ret: nothing
+*/
+void
+cpu_lower_hw_int_line(cpu_t *cpu)
+{
+	cpu->lower_hw_int_fn(&cpu->cpu_ctx);
 }
 
 /*
@@ -318,7 +414,7 @@ get_host_ptr(cpu_t *cpu, addr_t addr)
 			return static_cast<uint8_t *>(get_ram_host_ptr(cpu, phys_addr));
 
 		case mem_type::rom:
-			return static_cast<uint8_t *>(get_rom_host_ptr(cpu, region, phys_addr));
+			return static_cast<uint8_t *>(get_rom_host_ptr(region, phys_addr));
 		}
 
 		set_last_error(lc86_status::invalid_parameter);
@@ -335,20 +431,20 @@ get_host_ptr(cpu_t *cpu, addr_t addr)
 // implemented with uint16_t, and there's always a nullptr cached at index zero. Additionally, the number of unmapped regions is variable, and depends of the number
 // of merging and splitting events that involve unmapped regions in the address_space object. These are currently not tracked, which is why the memory APIs below
 // don't track the number of regions currently added to the system.
-// NOTE2: these functions will throw a host_exp_t::region_changed exception when they detect the need to flush the code cache, so only call them last. If you still need
-// to do more work after them, then you can catch the exception, do your work in the catch block, and then re-throw the exception. You can suppress the exception by
-// passing should_throw=true. This is useful before you have called cpu_run to start the emulation, since at that point no code has been generated yet.
+// NOTE2: these functions will raise a guest interrupt when they detect the need to flush the code cache. You can suppress the interrupt and make them have effect
+// immediately by passing should_int=false. This is only safe before you have called cpu_run/cpu_run_until to start the emulation, since at that point no code
+// has been generated yet.
 
 /*
-* mem_init_region_ram -> creates a ram region (can throw an exception)
+* mem_init_region_ram -> creates a ram region. If more than one is added, the address range of the existing one is erased
 * cpu: a valid cpu instance
 * start: the guest physical address where the ram starts
 * size: size in bytes of ram
-* should_throw: suppresses the exception when false, otherwise can throw
+* should_int: raises a guest interrupt when true, otherwise the change takes effect immediately
 * ret: the status of the operation
 */
 lc86_status
-mem_init_region_ram(cpu_t *cpu, addr_t start, size_t size, bool should_throw)
+mem_init_region_ram(cpu_t *cpu, addr_t start, uint32_t size, bool should_int)
 {
 	if (size == 0) {
 		return set_last_error(lc86_status::invalid_parameter);
@@ -356,30 +452,38 @@ mem_init_region_ram(cpu_t *cpu, addr_t start, size_t size, bool should_throw)
 
 	std::unique_ptr<memory_region_t<addr_t>> ram(new memory_region_t<addr_t>);
 	ram->start = start;
-	ram->end = start + size - 1;
+	ram->end = std::min(static_cast<uint64_t>(start) + size - 1, 0xFFFFFFFFULL);
 	ram->type = mem_type::ram;
-	cpu->memory_space_tree->insert(std::move(ram));
 
-	if (tc_should_clear_cache_and_tlb(cpu, start, start + size - 1, should_throw)) {
-		throw host_exp_t::region_changed;
+	if (should_int) {
+		cpu->regions_changed.push_back(std::make_pair(true, std::move(ram)));
+		cpu->raise_int_fn(&cpu->cpu_ctx, CPU_REGION_INT);
+	}
+	else {
+		if (auto ram = as_memory_search_addr(cpu, cpu->ram_start); ram->type == mem_type::ram) {
+			cpu->memory_space_tree->erase(ram->start, ram->end);
+		}
+		cpu->ram_start = start;
+		cpu->memory_space_tree->insert(std::move(ram));
+		tc_should_clear_cache_and_tlb<true>(cpu, start, start + size - 1);
 	}
 
 	return lc86_status::success;
 }
 
 /*
-* mem_init_region_io -> creates an mmio or pmio region (can throw an exception for mmio only)
+* mem_init_region_io -> creates an mmio or pmio region
 * cpu: a valid cpu instance
 * start: where the region starts
 * size: size of the region
 * io_space: true for pmio, and false for mmio
 * handlers: a struct of function pointers to call back when the region is accessed from the guest
 * opaque: an arbitrary host pointer which is passed to the registered r/w function for the region
-* should_throw: suppresses the exception when false, otherwise can throw
+* should_int: raises a guest interrupt when true, otherwise the change takes effect immediately
 * ret: the status of the operation
 */
 lc86_status
-mem_init_region_io(cpu_t *cpu, addr_t start, size_t size, bool io_space, io_handlers_t handlers, void *opaque, bool should_throw)
+mem_init_region_io(cpu_t *cpu, addr_t start, uint32_t size, bool io_space, io_handlers_t handlers, void *opaque, bool should_int)
 {
 	if (size == 0) {
 		return set_last_error(lc86_status::invalid_parameter);
@@ -392,7 +496,8 @@ mem_init_region_io(cpu_t *cpu, addr_t start, size_t size, bool io_space, io_hand
 
 		std::unique_ptr<memory_region_t<port_t>> io(new memory_region_t<port_t>);
 		io->start = static_cast<port_t>(start);
-		io->end = static_cast<port_t>(start) + size - 1;
+		uint64_t end_io1 = io->start + size - 1;
+		io->end = std::min(end_io1, 0xFFFFULL);
 		io->type = mem_type::pmio;
 		io->handlers.fnr8 = handlers.fnr8 ? handlers.fnr8 : default_pmio_read_handler8;
 		io->handlers.fnr16 = handlers.fnr16 ? handlers.fnr16 : default_pmio_read_handler16;
@@ -400,16 +505,14 @@ mem_init_region_io(cpu_t *cpu, addr_t start, size_t size, bool io_space, io_hand
 		io->handlers.fnw8 = handlers.fnw8 ? handlers.fnw8 : default_pmio_write_handler8;
 		io->handlers.fnw16 = handlers.fnw16 ? handlers.fnw16 : default_pmio_write_handler16;
 		io->handlers.fnw32 = handlers.fnw32 ? handlers.fnw32 : default_pmio_write_handler32;
-		if (opaque) {
-			io->opaque = opaque;
-		}
+		io->opaque = opaque;
 
 		cpu->io_space_tree->insert(std::move(io));
 	}
 	else {
 		std::unique_ptr<memory_region_t<addr_t>> mmio(new memory_region_t<addr_t>);
 		mmio->start = start;
-		mmio->end = start + size - 1;
+		mmio->end = std::min(static_cast<uint64_t>(start) + size - 1, 0xFFFFFFFFULL);
 		mmio->type = mem_type::mmio;
 		mmio->handlers.fnr8 = handlers.fnr8 ? handlers.fnr8 : default_mmio_read_handler8;
 		mmio->handlers.fnr16 = handlers.fnr16 ? handlers.fnr16 : default_mmio_read_handler16;
@@ -419,13 +522,15 @@ mem_init_region_io(cpu_t *cpu, addr_t start, size_t size, bool io_space, io_hand
 		mmio->handlers.fnw16 = handlers.fnw16 ? handlers.fnw16 : default_mmio_write_handler16;
 		mmio->handlers.fnw32 = handlers.fnw32 ? handlers.fnw32 : default_mmio_write_handler32;
 		mmio->handlers.fnw64 = handlers.fnw64 ? handlers.fnw64 : default_mmio_write_handler64;
-		if (opaque) {
-			mmio->opaque = opaque;
-		}
-		cpu->memory_space_tree->insert(std::move(mmio));
+		mmio->opaque = opaque;
 
-		if (tc_should_clear_cache_and_tlb(cpu, start, start + size - 1, should_throw)) {
-			throw host_exp_t::region_changed;
+		if (should_int) {
+			cpu->regions_changed.push_back(std::make_pair(true, std::move(mmio)));
+			cpu->raise_int_fn(&cpu->cpu_ctx, CPU_REGION_INT);
+		}
+		else {
+			cpu->memory_space_tree->insert(std::move(mmio));
+			tc_should_clear_cache_and_tlb<true>(cpu, start, start + size - 1);
 		}
 	}
 
@@ -433,16 +538,16 @@ mem_init_region_io(cpu_t *cpu, addr_t start, size_t size, bool io_space, io_hand
 }
 
 /*
-* mem_init_region_alias -> creates a region that points to another region (which must not be pmio; can throw an exception)
+* mem_init_region_alias -> creates a region that points to another region
 * cpu: a valid cpu instance
 * alias_start: the guest physical address where the alias starts
 * ori_start: the guest physical address where the original region starts
 * ori_size: size in bytes of alias
-* should_throw: suppresses the exception when false, otherwise can throw
+* should_int: raises a guest interrupt when true, otherwise the change takes effect immediately
 * ret: the status of the operation
 */
 lc86_status
-mem_init_region_alias(cpu_t *cpu, addr_t alias_start, addr_t ori_start, size_t ori_size, bool should_throw)
+mem_init_region_alias(cpu_t *cpu, addr_t alias_start, addr_t ori_start, uint32_t ori_size, bool should_int)
 {
 	if (ori_size == 0) {
 		return set_last_error(lc86_status::invalid_parameter);
@@ -452,14 +557,18 @@ mem_init_region_alias(cpu_t *cpu, addr_t alias_start, addr_t ori_start, size_t o
 	if ((aliased_region->start <= ori_start) && (aliased_region->end >= (ori_start + ori_size - 1)) && (aliased_region->type != mem_type::unmapped)) {
 		std::unique_ptr<memory_region_t<addr_t>> alias(new memory_region_t<addr_t>);
 		alias->start = alias_start;
-		alias->end = alias_start + ori_size - 1;
+		alias->end = std::min(static_cast<uint64_t>(alias_start) + ori_size - 1, 0xFFFFFFFFULL);
 		alias->alias_offset = ori_start - aliased_region->start;
 		alias->type = mem_type::alias;
 		alias->aliased_region = aliased_region;
-		cpu->memory_space_tree->insert(std::move(alias));
 
-		if (tc_should_clear_cache_and_tlb(cpu, alias_start, alias_start + ori_size - 1, should_throw)) {
-			throw host_exp_t::region_changed;
+		if (should_int) {
+			cpu->regions_changed.push_back(std::make_pair(true, std::move(alias)));
+			cpu->raise_int_fn(&cpu->cpu_ctx, CPU_REGION_INT);
+		}
+		else {
+			cpu->memory_space_tree->insert(std::move(alias));
+			tc_should_clear_cache_and_tlb<true>(cpu, alias_start, alias_start + ori_size - 1);
 		}
 
 		return lc86_status::success;
@@ -469,16 +578,16 @@ mem_init_region_alias(cpu_t *cpu, addr_t alias_start, addr_t ori_start, size_t o
 }
 
 /*
-* mem_init_region_rom -> creates a rom region (can throw an exception)
+* mem_init_region_rom -> creates a rom region
 * cpu: a valid cpu instance
 * start: the guest physical address where the rom starts
 * size: size in bytes of rom
 * buffer: a pointer to a client-allocated buffer that holds the rom the region refers to
-* should_throw: suppresses the exception when false, otherwise can throw
+* should_int: raises a guest interrupt when true, otherwise the change takes effect immediately
 * ret: the status of the operation
 */
 lc86_status
-mem_init_region_rom(cpu_t *cpu, addr_t start, size_t size, uint8_t *buffer, bool should_throw)
+mem_init_region_rom(cpu_t *cpu, addr_t start, uint32_t size, uint8_t *buffer, bool should_int)
 {
 	if ((size == 0) || !(buffer)) {
 		return set_last_error(lc86_status::invalid_parameter);
@@ -486,65 +595,71 @@ mem_init_region_rom(cpu_t *cpu, addr_t start, size_t size, uint8_t *buffer, bool
 
 	std::unique_ptr<memory_region_t<addr_t>> rom(new memory_region_t<addr_t>);
 	rom->start = start;
-	rom->end = start + size - 1;
+	rom->end = std::min(static_cast<uint64_t>(start) + size - 1, 0xFFFFFFFFULL);
 	rom->type = mem_type::rom;
-	rom->rom_idx = cpu->vec_rom.size() - 1;
-	cpu->memory_space_tree->insert(std::move(rom));
-	cpu->vec_rom.push_back(buffer);
+	rom->rom_ptr = buffer;
 
-	if (tc_should_clear_cache_and_tlb(cpu, start, start + size - 1, should_throw)) {
-		throw host_exp_t::region_changed;
+	if (should_int) {
+		cpu->regions_changed.push_back(std::make_pair(true, std::move(rom)));
+		cpu->raise_int_fn(&cpu->cpu_ctx, CPU_REGION_INT);
+	}
+	else {
+		cpu->memory_space_tree->insert(std::move(rom));
+		tc_should_clear_cache_and_tlb<true>(cpu, start, start + size - 1);
 	}
 
 	return lc86_status::success;
 }
 
 /*
-* mem_destroy_region -> marks a range of addresses as unmapped (can throw an exception for any region but pmio)
+* mem_destroy_region -> marks a range of addresses as unmapped
 * cpu: a valid cpu instance
 * start: the guest physical address where to start the unmapping
 * size: size in bytes to unmap
 * io_space: true for pmio, false for mmio and ignored for the other regions
-* should_throw: suppresses the exception when false, otherwise can throw
+* should_int: raises a guest interrupt when true, otherwise the change takes effect immediately
 * ret: always success
 */
 lc86_status
-mem_destroy_region(cpu_t *cpu, addr_t start, size_t size, bool io_space, bool should_throw)
+mem_destroy_region(cpu_t *cpu, addr_t start, uint32_t size, bool io_space, bool should_int)
 {
 	if (io_space) {
 		port_t start_io = static_cast<port_t>(start);
-		port_t end_io = start + size - 1;
+		uint64_t end_io1 = start_io + size - 1;
+		port_t end_io = std::min(end_io1, 0xFFFFULL);
 		cpu->io_space_tree->erase(start_io, end_io);
 	}
 	else {
-		cpu->memory_space_tree->erase(start, start + size - 1);
-		if (tc_should_clear_cache_and_tlb(cpu, start, start + size - 1, should_throw)) {
-			throw host_exp_t::region_changed;
+		addr_t end = std::min(static_cast<uint64_t>(start) + size - 1, 0xFFFFFFFFULL);
+		if (should_int) {
+			cpu->regions_changed.push_back(std::make_pair(false, std::make_unique<memory_region_t<addr_t>>(start, end)));
+			cpu->raise_int_fn(&cpu->cpu_ctx, CPU_REGION_INT);
+		}
+		else {
+			cpu->memory_space_tree->erase(start, end);
+			tc_should_clear_cache_and_tlb<true>(cpu, start, end);
 		}
 	}
 	return lc86_status::success;
 }
 
-/*
-* mem_read_block -> reads a block of memory from ram/rom
-* cpu: a valid cpu instance
-* addr: the guest virtual address to read from
-* size: number of bytes to read
-* out: pointer where the read contents are stored to
-* actual_size: number of bytes actually read
-* ret: the status of the operation
-*/
-lc86_status
-mem_read_block(cpu_t *cpu, addr_t addr, size_t size, uint8_t *out, size_t *actual_size)
+template<bool is_virt>
+lc86_status mem_read_block(cpu_t *cpu, addr_t addr, uint32_t size, uint8_t *out, uint32_t *actual_size)
 {
-	size_t vec_offset = 0;
-	size_t page_offset = addr & PAGE_MASK;
-	size_t size_left = size;
+	uint32_t vec_offset = 0;
+	uint32_t page_offset = addr & PAGE_MASK;
+	uint32_t size_left = size;
 
 	try {
 		while (size_left > 0) {
-			size_t bytes_to_read = std::min(PAGE_SIZE - page_offset, size_left);
-			addr_t phys_addr = get_read_addr(cpu, addr, 0, 0);
+			addr_t phys_addr;
+			uint32_t bytes_to_read = std::min(PAGE_SIZE - page_offset, size_left);
+			if constexpr (is_virt) {
+				phys_addr = get_read_addr(cpu, addr, 0, 0);
+			}
+			else {
+				phys_addr = addr;
+			}
 
 			const memory_region_t<addr_t> *region = as_memory_search_addr(cpu, phys_addr);
 			retry:
@@ -556,7 +671,7 @@ mem_read_block(cpu_t *cpu, addr_t addr, size_t size, uint8_t *out, size_t *actua
 					break;
 
 				case mem_type::rom:
-					std::memcpy(out + vec_offset, get_rom_host_ptr(cpu, region, phys_addr), bytes_to_read);
+					std::memcpy(out + vec_offset, get_rom_host_ptr(region, phys_addr), bytes_to_read);
 					break;
 
 				case mem_type::alias: {
@@ -603,20 +718,48 @@ mem_read_block(cpu_t *cpu, addr_t addr, size_t size, uint8_t *out, size_t *actua
 	}
 }
 
-template<bool fill>
-lc86_status mem_write_handler(cpu_t *cpu, addr_t addr, size_t size, const void *buffer, int val, size_t *actual_size)
+/*
+* mem_read_block -> reads a block of memory from ram/rom. Addr is either a virtual (_virt) or physical (_phys) guest address
+* cpu: a valid cpu instance
+* addr: the guest address to read from
+* size: number of bytes to read
+* out: pointer where the read contents are stored to
+* actual_size: number of bytes actually read
+* ret: the status of the operation
+*/
+lc86_status
+mem_read_block_virt(cpu_t *cpu, addr_t addr, uint32_t size, uint8_t *out, uint32_t *actual_size)
 {
-	size_t size_tot = 0;
-	size_t page_offset = addr & PAGE_MASK;
-	size_t size_left = size;
+	return mem_read_block<true>(cpu, addr, size, out, actual_size);
+}
+
+lc86_status
+mem_read_block_phys(cpu_t *cpu, addr_t addr, uint32_t size, uint8_t *out, uint32_t *actual_size)
+{
+	return mem_read_block<false>(cpu, addr, size, out, actual_size);
+}
+
+template<bool fill, bool is_virt>
+lc86_status mem_write_handler(cpu_t *cpu, addr_t addr, uint32_t size, const void *buffer, int val, uint32_t *actual_size)
+{
+	uint32_t size_tot = 0;
+	uint32_t page_offset = addr & PAGE_MASK;
+	uint32_t size_left = size;
 
 	try {
 		while (size_left > 0) {
 			uint8_t is_code;
-			size_t bytes_to_write = std::min(PAGE_SIZE - page_offset, size_left);
-			addr_t phys_addr = get_write_addr(cpu, addr, 0, 0, &is_code);
-			if (is_code) {
-				tc_invalidate(&cpu->cpu_ctx, phys_addr, bytes_to_write, cpu->cpu_ctx.regs.eip);
+			addr_t phys_addr;
+			uint32_t bytes_to_write = std::min(PAGE_SIZE - page_offset, size_left);
+			if constexpr (is_virt) {
+				phys_addr = get_write_addr(cpu, addr, 0, 0, &is_code);
+				if (is_code) {
+					tc_invalidate<false, false>(&cpu->cpu_ctx, phys_addr, bytes_to_write, cpu->cpu_ctx.regs.eip);
+				}
+			}
+			else {
+				phys_addr = addr;
+				tc_invalidate<false, false>(&cpu->cpu_ctx, phys_addr, bytes_to_write, cpu->cpu_ctx.regs.eip);
 			}
 
 			const memory_region_t<addr_t> *region = as_memory_search_addr(cpu, phys_addr);
@@ -682,7 +825,7 @@ lc86_status mem_write_handler(cpu_t *cpu, addr_t addr, size_t size, const void *
 }
 
 /*
-* mem_write_block -> writes a block of memory to ram/rom
+* mem_write_block -> writes a block of memory to ram/rom. Addr is either a virtual (_virt) or physical (_phys) guest address
 * cpu: a valid cpu instance
 * addr: the guest virtual address to write to
 * size: number of bytes to write
@@ -691,24 +834,36 @@ lc86_status mem_write_handler(cpu_t *cpu, addr_t addr, size_t size, const void *
 * ret: the status of the operation
 */
 lc86_status
-mem_write_block(cpu_t *cpu, addr_t addr, size_t size, const void *buffer, size_t *actual_size)
+mem_write_block_virt(cpu_t *cpu, addr_t addr, uint32_t size, const void *buffer, uint32_t *actual_size)
 {
-	return mem_write_handler<false>(cpu, addr, size, buffer, 0, actual_size);
+	return mem_write_handler<false, true>(cpu, addr, size, buffer, 0, actual_size);
+}
+
+lc86_status
+mem_write_block_phys(cpu_t *cpu, addr_t addr, uint32_t size, const void *buffer, uint32_t *actual_size)
+{
+	return mem_write_handler<false, false>(cpu, addr, size, buffer, 0, actual_size);
 }
 
 /*
-* mem_fill_block -> fills ram/rom with a value
+* mem_fill_block -> fills ram/rom with a value. Addr is either a virtual (_virt) or physical (_phys) guest address
 * cpu: a valid cpu instance
-* addr: the guest virtual address to write to
+* addr: the guest address to write to
 * size: number of bytes to write
 * val: the value to write
 * actual_size: number of bytes actually written
 * ret: the status of the operation
 */
 lc86_status
-mem_fill_block(cpu_t *cpu, addr_t addr, size_t size, int val, size_t *actual_size)
+mem_fill_block_virt(cpu_t *cpu, addr_t addr, uint32_t size, int val, uint32_t *actual_size)
 {
-	return mem_write_handler<true>(cpu, addr, size, nullptr, val, actual_size);
+	return mem_write_handler<true, true>(cpu, addr, size, nullptr, val, actual_size);
+}
+
+lc86_status
+mem_fill_block_phys(cpu_t *cpu, addr_t addr, uint32_t size, int val, uint32_t *actual_size)
+{
+	return mem_write_handler<true, false>(cpu, addr, size, nullptr, val, actual_size);
 }
 
 /*
@@ -822,7 +977,7 @@ hook_remove(cpu_t *cpu, addr_t addr)
 		uint8_t is_code;
 		volatile addr_t phys_addr = get_write_addr(cpu, addr, 2, cpu->cpu_ctx.regs.eip, &is_code);
 		cpu->hook_map.erase(it);
-		tc_invalidate<true>(&cpu->cpu_ctx, addr);
+		tc_invalidate<true, false>(&cpu->cpu_ctx, addr);
 	}
 	catch (host_exp_t type) {
 		return set_last_error(lc86_status::guest_exp);

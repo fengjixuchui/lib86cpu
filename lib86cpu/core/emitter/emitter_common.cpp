@@ -8,6 +8,7 @@
 #include "instructions.h"
 #include "memory.h"
 #include "debugger.h"
+#include "clock.h"
 
 #define JIT_LOCAL_VARS_STACK_SIZE  0x30 // must be a multiple of 16
 #define JIT_REG_ARGS_STACK_SIZE    0x20
@@ -18,8 +19,13 @@
 // NOTE1: the jitted main() and exit() are also called during code linking, but those only use register args
 // NOTE2: this assumes the Windows x64 calling convention
 constexpr auto all_callable_funcs = std::make_tuple(
-	cpu_raise_exception<true>,
-	cpu_raise_exception<false>,
+	cpu_raise_exception<true, true>,
+	cpu_raise_exception<true, false>,
+	cpu_raise_exception<false, true>,
+	cpu_raise_exception<false, false>,
+	cpu_timer_helper<true>,
+	cpu_timer_helper<false>,
+	cpu_do_int,
 	link_indirect_handler,
 	mem_read_helper<uint32_t>,
 	mem_read_helper<uint16_t>,
@@ -49,13 +55,17 @@ constexpr auto all_callable_funcs = std::make_tuple(
 	mov_sel_pe_helper<ES_idx>,
 	mov_sel_pe_helper<FS_idx>,
 	mov_sel_pe_helper<GS_idx>,
-	cpu_rdtsc_handler,
+	cpu_rdtsc_helper,
+	msr_read_helper,
+	msr_write_helper,
 	divd_helper,
 	divw_helper,
 	divb_helper,
 	idivd_helper,
 	idivw_helper,
 	idivb_helper,
+	cpuid_helper,
+	hlt_helper,
 	cpu_runtime_abort,
 	dbg_update_exp_hook
 );

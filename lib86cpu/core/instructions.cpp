@@ -893,7 +893,7 @@ update_drN_helper(cpu_ctx_t *cpu_ctx, uint8_t dr_idx, uint32_t new_dr)
 	}
 }
 
-void
+uint8_t
 msr_read_helper(cpu_ctx_t *cpu_ctx)
 {
 	uint64_t val;
@@ -901,8 +901,11 @@ msr_read_helper(cpu_ctx_t *cpu_ctx)
 	switch (cpu_ctx->regs.ecx)
 	{
 	case IA32_APIC_BASE:
-		// hardcoded value for now
-		val = 0xFEE00000 | (1 << 11) | (1 << 8);
+		val = MSR_IA32_APICBASE_BSP;
+		break;
+
+	case IA32_MTRRCAP:
+		val = (MSR_MTRRcap_VCNT | MSR_MTRRcap_FIX | MSR_MTRRcap_WC);
 		break;
 
 	case IA32_MTRR_PHYSBASE(0):
@@ -913,7 +916,7 @@ msr_read_helper(cpu_ctx_t *cpu_ctx)
 	case IA32_MTRR_PHYSBASE(5):
 	case IA32_MTRR_PHYSBASE(6):
 	case IA32_MTRR_PHYSBASE(7):
-		val = cpu_ctx->cpu->mtrr.phys_var[(cpu_ctx->regs.ecx - MTRR_PHYSBASE_base) / 2].base;
+		val = cpu_ctx->cpu->msr.mtrr.phys_var[(cpu_ctx->regs.ecx - IA32_MTRR_PHYSBASE_base) / 2].base;
 		break;
 
 	case IA32_MTRR_PHYSMASK(0):
@@ -924,7 +927,31 @@ msr_read_helper(cpu_ctx_t *cpu_ctx)
 	case IA32_MTRR_PHYSMASK(5):
 	case IA32_MTRR_PHYSMASK(6):
 	case IA32_MTRR_PHYSMASK(7):
-		val = cpu_ctx->cpu->mtrr.phys_var[(cpu_ctx->regs.ecx - MTRR_PHYSMASK_base) / 2].mask;
+		val = cpu_ctx->cpu->msr.mtrr.phys_var[(cpu_ctx->regs.ecx - IA32_MTRR_PHYSMASK_base) / 2].mask;
+		break;
+
+	case IA32_MTRR_FIX64K_00000:
+		val = cpu_ctx->cpu->msr.mtrr.phys_fixed[0];
+		break;
+
+	case IA32_MTRR_FIX16K_80000:
+	case IA32_MTRR_FIX16K_A0000:
+		val = cpu_ctx->cpu->msr.mtrr.phys_fixed[cpu_ctx->regs.ecx - IA32_MTRR_FIX16K_80000 + 1];
+		break;
+
+	case IA32_MTRR_FIX4K_C0000:
+	case IA32_MTRR_FIX4K_C8000:
+	case IA32_MTRR_FIX4K_D0000:
+	case IA32_MTRR_FIX4K_D8000:
+	case IA32_MTRR_FIX4K_E0000:
+	case IA32_MTRR_FIX4K_E8000:
+	case IA32_MTRR_FIX4K_F0000:
+	case IA32_MTRR_FIX4K_F8000:
+		val = cpu_ctx->cpu->msr.mtrr.phys_fixed[cpu_ctx->regs.ecx - IA32_MTRR_FIX4K_C0000 + 3];
+		break;
+
+	case IA32_MTRR_DEF_TYPE:
+		val = cpu_ctx->cpu->msr.mtrr.def_type;
 		break;
 
 	default:
@@ -933,6 +960,86 @@ msr_read_helper(cpu_ctx_t *cpu_ctx)
 
 	cpu_ctx->regs.edx = (val >> 32);
 	cpu_ctx->regs.eax = val;
+
+	return 0;
+}
+
+uint8_t
+msr_write_helper(cpu_ctx_t *cpu_ctx)
+{
+	uint64_t val = (static_cast<uint64_t>(cpu_ctx->regs.edx) << 32) | cpu_ctx->regs.eax;
+
+	switch (cpu_ctx->regs.ecx)
+	{
+	case IA32_APIC_BASE:
+		if (val & MSR_IA32_APIC_BASE_RES) {
+			return 1;
+		}
+		break;
+
+	case IA32_MTRRCAP:
+		return 1;
+
+	case IA32_MTRR_PHYSBASE(0):
+	case IA32_MTRR_PHYSBASE(1):
+	case IA32_MTRR_PHYSBASE(2):
+	case IA32_MTRR_PHYSBASE(3):
+	case IA32_MTRR_PHYSBASE(4):
+	case IA32_MTRR_PHYSBASE(5):
+	case IA32_MTRR_PHYSBASE(6):
+	case IA32_MTRR_PHYSBASE(7):
+		if (val & MSR_MTRR_PHYSBASE_RES) {
+			return 1;
+		}
+		cpu_ctx->cpu->msr.mtrr.phys_var[(cpu_ctx->regs.ecx - IA32_MTRR_PHYSBASE_base) / 2].base = val;
+		break;
+
+	case IA32_MTRR_PHYSMASK(0):
+	case IA32_MTRR_PHYSMASK(1):
+	case IA32_MTRR_PHYSMASK(2):
+	case IA32_MTRR_PHYSMASK(3):
+	case IA32_MTRR_PHYSMASK(4):
+	case IA32_MTRR_PHYSMASK(5):
+	case IA32_MTRR_PHYSMASK(6):
+	case IA32_MTRR_PHYSMASK(7):
+		if (val & MSR_MTRR_PHYSMASK_RES) {
+			return 1;
+		}
+		cpu_ctx->cpu->msr.mtrr.phys_var[(cpu_ctx->regs.ecx - IA32_MTRR_PHYSMASK_base) / 2].mask = val;
+		break;
+
+	case IA32_MTRR_FIX64K_00000:
+		cpu_ctx->cpu->msr.mtrr.phys_fixed[0] = val;
+		break;
+
+	case IA32_MTRR_FIX16K_80000:
+	case IA32_MTRR_FIX16K_A0000:
+		cpu_ctx->cpu->msr.mtrr.phys_fixed[cpu_ctx->regs.ecx - IA32_MTRR_FIX16K_80000 + 1] = val;
+		break;
+
+	case IA32_MTRR_FIX4K_C0000:
+	case IA32_MTRR_FIX4K_C8000:
+	case IA32_MTRR_FIX4K_D0000:
+	case IA32_MTRR_FIX4K_D8000:
+	case IA32_MTRR_FIX4K_E0000:
+	case IA32_MTRR_FIX4K_E8000:
+	case IA32_MTRR_FIX4K_F0000:
+	case IA32_MTRR_FIX4K_F8000:
+		cpu_ctx->cpu->msr.mtrr.phys_fixed[cpu_ctx->regs.ecx - IA32_MTRR_FIX4K_C0000 + 3] = val;
+		break;
+
+	case IA32_MTRR_DEF_TYPE:
+		if (val & MSR_MTRR_DEF_TYPE_RES) {
+			return 1;
+		}
+		cpu_ctx->cpu->msr.mtrr.def_type = val;
+		break;
+
+	default:
+		LIB86CPU_ABORT_msg("Unhandled msr write to register at address 0x%X", cpu_ctx->regs.ecx);
+	}
+
+	return 0;
 }
 
 uint8_t
@@ -1048,6 +1155,59 @@ idivb_helper(cpu_ctx_t *cpu_ctx, uint8_t d, uint32_t eip)
 	q &= 0xFF;
 	r &= 0xFF;
 	cpu_ctx->regs.eax = (cpu_ctx->regs.eax & ~0xFFFF) | (r << 8) | q;
+
+	return 0;
+}
+
+void
+cpuid_helper(cpu_ctx_t *cpu_ctx)
+{
+	// these are the same values that the xbox cpu reports with cpuid. They were tested against real hardware here https://github.com/mborgerson/xemu/issues/509
+
+	switch (cpu_ctx->regs.eax)
+	{
+	default:
+	case 2:
+		cpu_ctx->regs.eax = 0x03020101;
+		cpu_ctx->regs.ebx = 0;
+		cpu_ctx->regs.edx = 0x0C040841;
+		cpu_ctx->regs.ecx = 0;
+		break;
+
+	case 1:
+		cpu_ctx->regs.eax = 0x0000068A;
+		cpu_ctx->regs.ebx = 0;
+		cpu_ctx->regs.edx = 0x0383F9FF; // fpu, vme, de, pse, tsc, msr, pae, mce, cx8, sep, mtrr, pge, mca, cmov, pat, pse-36, mmx, fxsr, sse
+		cpu_ctx->regs.ecx = 0;
+		break;
+
+	case 0:
+		cpu_ctx->regs.eax = 2;
+		cpu_ctx->regs.ebx = 0x756E6547; // "Genu"
+		cpu_ctx->regs.edx = 0x49656E69; // "ineI"
+		cpu_ctx->regs.ecx = 0x6C65746E; // "ntel"
+		break;
+	}
+}
+
+uint32_t
+hlt_helper(cpu_ctx_t *cpu_ctx)
+{
+	uint32_t int_flg = cpu_ctx->cpu->read_int_fn(cpu_ctx);
+	if (int_flg & CPU_ABORT_INT) {
+		// abort interrupts are checked so that the client can still terminate the emulation with cpu_exit, in the case hw interrupts were
+		// masked by the guest or not sent by the client
+		throw lc86_exp_abort("Received abort signal, terminating the emulation", lc86_status::success);
+	}
+
+	if (((int_flg & CPU_HW_INT) | (cpu_ctx->regs.eflags & IF_MASK)) == (CPU_HW_INT | IF_MASK)) {
+		cpu_ctx->exp_info.exp_data.fault_addr = 0;
+		cpu_ctx->exp_info.exp_data.code = 0;
+		cpu_ctx->exp_info.exp_data.idx = cpu_ctx->cpu->get_int_vec();
+		cpu_ctx->exp_info.exp_data.eip = cpu_ctx->regs.eip;
+		cpu_raise_exception<false, true>(cpu_ctx);
+		return 1;
+	}
 
 	return 0;
 }

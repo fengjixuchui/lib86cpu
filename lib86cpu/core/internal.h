@@ -18,8 +18,9 @@ void tc_should_clear_cache_and_tlb(cpu_t *cpu, addr_t start, addr_t end);
 void tc_cache_clear(cpu_t *cpu);
 void tc_cache_purge(cpu_t *cpu);
 addr_t get_pc(cpu_ctx_t *cpu_ctx);
-template<bool is_int = false, bool is_hw = false> translated_code_t *cpu_raise_exception(cpu_ctx_t *cpu_ctx);
-translated_code_t *cpu_do_int(cpu_ctx_t *cpu_ctx, uint32_t int_flg);
+template<bool is_int = false, bool is_hw = false>
+translated_code_t *cpu_raise_exception(cpu_ctx_t *cpu_ctx);
+uint32_t cpu_do_int(cpu_ctx_t *cpu_ctx, uint32_t int_flg);
 
 // cpu hidden flags (assumed to be constant during exec of a tc, together with a flag subset of eflags)
 // HFLG_CPL: cpl of cpu
@@ -301,5 +302,10 @@ CR0_TS_MASK | CR0_EM_MASK | CR0_MP_MASK | CR0_PE_MASK)
 #define MSR_MTRR_PHYSBASE_RES      0xFFFFFFF000000F00
 #define MSR_MTRR_PHYSMASK_RES      0xFFFFFFF0000007FF
 #define MSR_MTRR_DEF_TYPE_RES      0xFFFFFFFFFFFFF300
+
+// cpu_timer_helper return statuses
+#define TIMER_NO_CHANGE 0
+#define TIMER_TIMEOUT   1
+#define TIMER_HW_INT    2
 
 #define X86_MAX_INSTR_LENGTH 15

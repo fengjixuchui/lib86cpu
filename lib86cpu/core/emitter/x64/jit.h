@@ -31,10 +31,9 @@ public:
 	void gen_code_block();
 	void gen_tc_prologue() { start_new_session(); gen_prologue_main(); }
 	void gen_tc_epilogue();
-	void gen_int_fn();
+	void gen_aux_funcs();
 	void gen_hook(void *hook_addr);
 	void gen_raise_exp_inline(uint32_t fault_addr, uint16_t code, uint16_t idx, uint32_t eip);
-	void halt_loop();
 	void free_code_block(void *addr) { m_mem.release_sys_mem(addr); }
 	void destroy_all_code() { m_mem.destroy_all_blocks(); }
 
@@ -60,9 +59,12 @@ public:
 	void cdq(ZydisDecodedInstruction *instr);
 	void cld(ZydisDecodedInstruction *instr);
 	void cli(ZydisDecodedInstruction *instr);
+	void cmc(ZydisDecodedInstruction *instr);
 	void cmovcc(ZydisDecodedInstruction *instr);
 	void cmp(ZydisDecodedInstruction *instr);
 	void cmps(ZydisDecodedInstruction *instr);
+	void cmpxchg(ZydisDecodedInstruction *instr);
+	void cmpxchg8b(ZydisDecodedInstruction *instr);
 	void cpuid(ZydisDecodedInstruction *instr);
 	void cwd(ZydisDecodedInstruction *instr);
 	void cwde(ZydisDecodedInstruction *instr);
@@ -70,6 +72,9 @@ public:
 	void das(ZydisDecodedInstruction *instr);
 	void dec(ZydisDecodedInstruction *instr);
 	void div(ZydisDecodedInstruction *instr);
+	void enter(ZydisDecodedInstruction *instr);
+	void fninit(ZydisDecodedInstruction *instr);
+	void fnstsw(ZydisDecodedInstruction *instr);
 	void hlt(ZydisDecodedInstruction *instr);
 	void idiv(ZydisDecodedInstruction *instr);
 	void imul(ZydisDecodedInstruction *instr);
@@ -78,6 +83,8 @@ public:
 	void ins(ZydisDecodedInstruction *instr);
 	void int3(ZydisDecodedInstruction *instr);
 	void intn(ZydisDecodedInstruction *instr);
+	void into(ZydisDecodedInstruction *instr);
+	void invlpg(ZydisDecodedInstruction *instr);
 	void iret(ZydisDecodedInstruction *instr);
 	void jcc(ZydisDecodedInstruction *instr);
 	void jmp(ZydisDecodedInstruction *instr);
@@ -104,6 +111,7 @@ public:
 	void not_(ZydisDecodedInstruction *instr);
 	void or_(ZydisDecodedInstruction *instr);
 	void out(ZydisDecodedInstruction *instr);
+	void outs(ZydisDecodedInstruction *instr);
 	void pop(ZydisDecodedInstruction *instr);
 	void popa(ZydisDecodedInstruction *instr);
 	void popf(ZydisDecodedInstruction *instr);
@@ -122,21 +130,27 @@ public:
 	void sbb(ZydisDecodedInstruction *instr);
 	void scas(ZydisDecodedInstruction *instr);
 	void setcc(ZydisDecodedInstruction *instr);
+	void sgdt(ZydisDecodedInstruction *instr);
 	void shl(ZydisDecodedInstruction *instr);
 	void shld(ZydisDecodedInstruction *instr);
 	void shr(ZydisDecodedInstruction *instr);
 	void shrd(ZydisDecodedInstruction *instr);
+	void sidt(ZydisDecodedInstruction *instr);
+	void sldt(ZydisDecodedInstruction *instr);
 	void stc(ZydisDecodedInstruction *instr);
 	void std(ZydisDecodedInstruction *instr);
 	void sti(ZydisDecodedInstruction *instr);
 	void stos(ZydisDecodedInstruction *instr);
+	void str(ZydisDecodedInstruction *instr);
 	void sub(ZydisDecodedInstruction *instr);
 	void test(ZydisDecodedInstruction *instr);
 	void verr(ZydisDecodedInstruction *instr);
 	void verw(ZydisDecodedInstruction *instr);
 	void wbinvd(ZydisDecodedInstruction *instr);
 	void wrmsr(ZydisDecodedInstruction *instr);
+	void xadd(ZydisDecodedInstruction *instr);
 	void xchg(ZydisDecodedInstruction *instr);
+	void xlat(ZydisDecodedInstruction *instr);
 	void xor_(ZydisDecodedInstruction *instr);
 
 #if defined(_WIN64)
@@ -154,8 +168,6 @@ private:
 	template<bool set_ret = true>
 	void gen_epilogue_main();
 	void gen_tail_call(x86::Gp addr);
-	template<unsigned idx>
-	void gen_int_fn();
 	void gen_block_end_checks();
 	void gen_no_link_checks();
 	bool gen_check_rf_single_step();
@@ -191,11 +203,11 @@ private:
 	template<bool is_sum, typename Imm, bool write_dst = true, typename T>
 	void imm_to_rm_flags(ZydisDecodedInstruction *instr, Imm src_imm, T &&lambda);
 	template<unsigned size, typename T>
-	void gen_sum_vec16_8(x86::Gp a, T b, x86::Gp sum);
+	void gen_sum_vec16_8(T b, x86::Gp sum);
 	template<typename T>
 	void gen_sum_vec32(T b);
 	template<unsigned size, typename T>
-	void gen_sub_vec16_8(x86::Gp a, T b, x86::Gp sum);
+	void gen_sub_vec16_8(T b, x86::Gp sum);
 	template<typename T>
 	void gen_sub_vec32(T b);
 	template<typename T>
@@ -211,7 +223,7 @@ private:
 	template<typename T>
 	void store_reg(T val, size_t reg_offset, size_t size);
 	void load_mem(uint8_t size, uint8_t is_priv);
-	template<typename T>
+	template<typename T, bool dont_write = false>
 	void store_mem(T val, uint8_t size, uint8_t is_priv);
 	void load_io(uint8_t size_mode);
 	void store_io(uint8_t size_mode);
@@ -220,8 +232,9 @@ private:
 	Label rep_start(Label end);
 	template<unsigned rep_prfx>
 	void rep(Label start, Label end);
-	template<typename... Args>
+	template<bool use_esp = true, typename... Args>
 	void gen_stack_push(Args... pushed_args);
+	void gen_virtual_stack_push();
 	template<unsigned num, unsigned store_at = 0, bool write_esp = true>
 	void gen_stack_pop();
 	template<unsigned idx>
@@ -232,6 +245,8 @@ private:
 	void rotate(ZydisDecodedInstruction *instr);
 	template<unsigned idx>
 	void load_sys_seg_reg(ZydisDecodedInstruction *instr);
+	template<unsigned idx>
+	void store_sys_seg_reg(ZydisDecodedInstruction *instr);
 	template<bool is_verr>
 	void verx(ZydisDecodedInstruction *instr);
 	template<unsigned idx>

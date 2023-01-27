@@ -110,6 +110,7 @@ set(SOURCES
  "${LIB86CPU_ROOT_DIR}/lib86cpu/dbg/glad/glad.c"
  "${LIB86CPU_ROOT_DIR}/lib86cpu/core/breakpoint.cpp"
  "${LIB86CPU_ROOT_DIR}/lib86cpu/core/decode.cpp"
+ "${LIB86CPU_ROOT_DIR}/lib86cpu/core/fpu.cpp"
  "${LIB86CPU_ROOT_DIR}/lib86cpu/core/helpers.cpp"
  "${LIB86CPU_ROOT_DIR}/lib86cpu/core/instructions.cpp"
  "${LIB86CPU_ROOT_DIR}/lib86cpu/core/memory.cpp"
@@ -125,7 +126,7 @@ source_group(TREE ${LIB86CPU_ROOT_DIR} PREFIX header FILES ${HEADERS})
 source_group(TREE ${LIB86CPU_ROOT_DIR} PREFIX source FILES ${SOURCES})
 
 if (MSVC)
-set(CMAKE_CXX_FLAGS "/EHs")
+set(CMAKE_CXX_FLAGS "/EHs /fp:strict")
 add_definitions(-D_CRT_SECURE_NO_WARNINGS -D_CRT_NONSTDC_NO_WARNINGS -D_SCL_SECURE_NO_WARNINGS -D__STDC_FORMAT_MACROS -D__STDC_CONSTANT_MACROS -D__STDC_LIMIT_MACROS)
 add_definitions(-wd4146)
 add_definitions(-wd4800)

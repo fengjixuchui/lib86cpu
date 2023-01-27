@@ -75,8 +75,14 @@ struct regs_t {
 	DEFINE_FP80(r5);
 	DEFINE_FP80(r6);
 	DEFINE_FP80(r7);
-	DEFINE_REG16(status);
-	DEFINE_REG16(tag);
+	DEFINE_REG16(fctrl);
+	DEFINE_REG16(fstatus);
+	uint8_t ftags[8]; // two tag bits of tag reg splitted in their own reg
+	DEFINE_REG16(fcs);
+	DEFINE_REG32(fip);
+	DEFINE_REG16(fds);
+	DEFINE_REG32(fdp);
+	DEFINE_REG16(fop);
 };
 
 struct msr_t {
@@ -88,4 +94,5 @@ struct msr_t {
 		uint64_t phys_fixed[11];
 		uint64_t def_type;
 	} mtrr;
+	uint64_t bios_sign_id;
 };

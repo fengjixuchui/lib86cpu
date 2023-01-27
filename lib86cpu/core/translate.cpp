@@ -39,13 +39,14 @@ cpu_reset(cpu_t *cpu)
 	cpu->cpu_ctx.regs.tr_hidden.limit = 0xFFFF;
 	cpu->cpu_ctx.regs.ldtr_hidden.flags = ((1 << 15) | (2 << 8)); // present, ldt
 	cpu->cpu_ctx.regs.tr_hidden.flags = ((1 << 15) | (11 << 8)); // present, 32bit tss busy
-	cpu->cpu_ctx.regs.tag = 0x5555;
+	cpu->cpu_ctx.lazy_eflags.result = 0x100; // make zf=0
 	cpu->a20_mask = 0xFFFFFFFF; // gate closed
 	cpu->cpu_ctx.exp_info.old_exp = EXP_INVALID;
 	cpu->msr.mtrr.def_type = 0;
 	std::memset(cpu->msr.mtrr.phys_var, 0, sizeof(cpu->msr.mtrr.phys_var));
 	std::memset(cpu->msr.mtrr.phys_fixed, 0, sizeof(cpu->msr.mtrr.phys_fixed));
 	tsc_init(cpu);
+	fpu_init(cpu);
 }
 
 static void
@@ -74,9 +75,11 @@ check_dbl_exp(cpu_ctx_t *cpu_ctx)
 	cpu_ctx->exp_info.exp_data.idx = idx;
 }
 
-template<bool is_int, bool is_hw>
+template<bool is_intn, bool is_hw_int>
 translated_code_t *cpu_raise_exception(cpu_ctx_t *cpu_ctx)
 {
+	// is_intn -> int3, into or intn instruction, is_hw_int -> hardware interrupt
+
 	check_dbl_exp(cpu_ctx);
 
 	cpu_t *cpu = cpu_ctx->cpu;
@@ -89,7 +92,7 @@ translated_code_t *cpu_raise_exception(cpu_ctx_t *cpu_ctx)
 	if (cpu_ctx->hflags & HFLG_PE_MODE) {
 		// protected mode
 
-		constexpr uint16_t ext_flg = is_int ? 0 : 1; // EXT flag clear for INT instructions, set otherwise
+		constexpr uint16_t ext_flg = is_intn ? 0 : 1; // EXT flag clear for INT instructions, set otherwise
 
 		if (idx * 8 + 7 > cpu_ctx->regs.idtr_hidden.limit) {
 			cpu_ctx->exp_info.exp_data.code = idx * 8 + 2 + ext_flg;
@@ -97,7 +100,7 @@ translated_code_t *cpu_raise_exception(cpu_ctx_t *cpu_ctx)
 			return cpu_raise_exception(cpu_ctx);
 		}
 
-		uint64_t desc = mem_read<uint64_t>(cpu, cpu_ctx->regs.idtr_hidden.base + idx * 8, eip, 2);
+		uint64_t desc = mem_read_helper<uint64_t>(cpu_ctx, cpu_ctx->regs.idtr_hidden.base + idx * 8, eip, 2);
 		uint16_t type = (desc >> 40) & 0x1F;
 		uint32_t new_eip, eflags;
 		switch (type)
@@ -126,7 +129,7 @@ translated_code_t *cpu_raise_exception(cpu_ctx_t *cpu_ctx)
 
 		uint32_t dpl = (desc & SEG_DESC_DPL) >> 45;
 		uint32_t cpl = cpu_ctx->hflags & HFLG_CPL;
-		if (is_int && (dpl < cpl)) { // only INT instructions check the dpl of the gate in the idt
+		if (is_intn && (dpl < cpl)) { // only INT instructions check the dpl of the gate in the idt
 			cpu_ctx->exp_info.exp_data.code = idx * 8 + 2;
 			cpu_ctx->exp_info.exp_data.idx = EXP_GP;
 			return cpu_raise_exception(cpu_ctx);
@@ -227,7 +230,7 @@ translated_code_t *cpu_raise_exception(cpu_ctx_t *cpu_ctx)
 		}
 
 		uint8_t has_code;
-		if constexpr (is_int || is_hw) {
+		if constexpr (is_intn || is_hw_int) {
 			// INT instructions and hw interrupts don't push error codes
 			has_code = 0;
 		}
@@ -253,34 +256,34 @@ translated_code_t *cpu_raise_exception(cpu_ctx_t *cpu_ctx)
 		if (stack_switch) {
 			if (type) { // push 32, priv
 				esp -= 4;
-				mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.ss, eip, 2);
+				mem_write_helper<uint32_t>(cpu_ctx, stack_base + (esp & stack_mask), cpu_ctx->regs.ss, eip, 2);
 				esp -= 4;
-				mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.esp, eip, 2);
+				mem_write_helper<uint32_t>(cpu_ctx, stack_base + (esp & stack_mask), cpu_ctx->regs.esp, eip, 2);
 				esp -= 4;
-				mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), old_eflags, eip, 2);
+				mem_write_helper<uint32_t>(cpu_ctx, stack_base + (esp & stack_mask), old_eflags, eip, 2);
 				esp -= 4;
-				mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 2);
+				mem_write_helper<uint32_t>(cpu_ctx, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 2);
 				esp -= 4;
-				mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), eip, eip, 2);
+				mem_write_helper<uint32_t>(cpu_ctx, stack_base + (esp & stack_mask), eip, eip, 2);
 				if (has_code) {
 					esp -= 4;
-					mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), code, eip, 2);
+					mem_write_helper<uint32_t>(cpu_ctx, stack_base + (esp & stack_mask), code, eip, 2);
 				}
 			}
 			else { // push 16, priv
 				esp -= 2;
-				mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.ss, eip, 2);
+				mem_write_helper<uint16_t>(cpu_ctx, stack_base + (esp & stack_mask), cpu_ctx->regs.ss, eip, 2);
 				esp -= 2;
-				mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.esp, eip, 2);
+				mem_write_helper<uint16_t>(cpu_ctx, stack_base + (esp & stack_mask), cpu_ctx->regs.esp, eip, 2);
 				esp -= 2;
-				mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), old_eflags, eip, 2);
+				mem_write_helper<uint16_t>(cpu_ctx, stack_base + (esp & stack_mask), old_eflags, eip, 2);
 				esp -= 2;
-				mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 2);
+				mem_write_helper<uint16_t>(cpu_ctx, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 2);
 				esp -= 2;
-				mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), eip, eip, 2);
+				mem_write_helper<uint16_t>(cpu_ctx, stack_base + (esp & stack_mask), eip, eip, 2);
 				if (has_code) {
 					esp -= 2;
-					mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), code, eip, 2);
+					mem_write_helper<uint16_t>(cpu_ctx, stack_base + (esp & stack_mask), code, eip, 2);
 				}
 			}
 
@@ -294,26 +297,26 @@ translated_code_t *cpu_raise_exception(cpu_ctx_t *cpu_ctx)
 		else {
 			if (type) { // push 32, not priv
 				esp -= 4;
-				mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), old_eflags, eip, 0);
+				mem_write_helper<uint32_t>(cpu_ctx, stack_base + (esp & stack_mask), old_eflags, eip, 0);
 				esp -= 4;
-				mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 0);
+				mem_write_helper<uint32_t>(cpu_ctx, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 0);
 				esp -= 4;
-				mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), eip, eip, 0);
+				mem_write_helper<uint32_t>(cpu_ctx, stack_base + (esp & stack_mask), eip, eip, 0);
 				if (has_code) {
 					esp -= 4;
-					mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), code, eip, 0);
+					mem_write_helper<uint32_t>(cpu_ctx, stack_base + (esp & stack_mask), code, eip, 0);
 				}
 			}
 			else { // push 16, not priv
 				esp -= 2;
-				mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), old_eflags, eip, 0);
+				mem_write_helper<uint16_t>(cpu_ctx, stack_base + (esp & stack_mask), old_eflags, eip, 0);
 				esp -= 2;
-				mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 0);
+				mem_write_helper<uint16_t>(cpu_ctx, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 0);
 				esp -= 2;
-				mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), eip, eip, 0);
+				mem_write_helper<uint16_t>(cpu_ctx, stack_base + (esp & stack_mask), eip, eip, 0);
 				if (has_code) {
 					esp -= 2;
-					mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), code, eip, 0);
+					mem_write_helper<uint16_t>(cpu_ctx, stack_base + (esp & stack_mask), code, eip, 0);
 				}
 			}
 		}
@@ -345,16 +348,16 @@ translated_code_t *cpu_raise_exception(cpu_ctx_t *cpu_ctx)
 			return cpu_raise_exception(cpu_ctx);
 		}
 
-		uint32_t vec_entry = mem_read<uint32_t>(cpu, cpu_ctx->regs.idtr_hidden.base + idx * 4, eip, 0);
+		uint32_t vec_entry = mem_read_helper<uint32_t>(cpu_ctx, cpu_ctx->regs.idtr_hidden.base + idx * 4, eip, 0);
 		uint32_t stack_mask = 0xFFFF;
 		uint32_t stack_base = cpu_ctx->regs.ss_hidden.base;
 		uint32_t esp = cpu_ctx->regs.esp;
 		esp -= 2;
-		mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), old_eflags, eip, 0);
+		mem_write_helper<uint16_t>(cpu_ctx, stack_base + (esp & stack_mask), old_eflags, eip, 0);
 		esp -= 2;
-		mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 0);
+		mem_write_helper<uint16_t>(cpu_ctx, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 0);
 		esp -= 2;
-		mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), eip, eip, 0);
+		mem_write_helper<uint16_t>(cpu_ctx, stack_base + (esp & stack_mask), eip, eip, 0);
 
 		cpu_ctx->regs.eflags &= ~(AC_MASK | RF_MASK | IF_MASK | TF_MASK);
 		cpu_ctx->regs.esp = (cpu_ctx->regs.esp & ~stack_mask) | (esp & stack_mask);
@@ -391,41 +394,19 @@ tc_hash(addr_t pc)
 	return pc & (CODE_CACHE_MAX_SIZE - 1);
 }
 
-template<bool remove_hook, bool is_virt>
-void tc_invalidate(cpu_ctx_t *cpu_ctx, addr_t addr, [[maybe_unused]] uint8_t size, [[maybe_unused]] uint32_t eip)
+template<bool remove_hook>
+void tc_invalidate(cpu_ctx_t *cpu_ctx, addr_t phys_addr, [[maybe_unused]] uint8_t size, [[maybe_unused]] uint32_t eip)
 {
 	bool halt_tc = false;
-	addr_t phys_addr;
-	uint8_t is_code;
+	bool is_code;
 
-	if constexpr (remove_hook) {
-		if constexpr (is_virt) {
-			phys_addr = get_write_addr(cpu_ctx->cpu, addr, 2, cpu_ctx->regs.eip, &is_code);
-		}
-		else {
-			phys_addr = addr;
-		}
-	}
-	else {
+	if constexpr (!remove_hook) {
 		if (cpu_ctx->cpu->cpu_flags & CPU_ALLOW_CODE_WRITE) {
 			return;
 		}
-
-		if constexpr (is_virt) {
-			try {
-				phys_addr = get_write_addr(cpu_ctx->cpu, addr, 2, eip, &is_code);
-			}
-			catch (host_exp_t type) {
-				// because all callers of this function translate the address already, this should never happen
-				LIB86CPU_ABORT_msg("Unexpected page fault in %s", __func__);
-			}
-		}
-		else {
-			phys_addr = addr;
-		}
 	}
 
-	// find all tc's in the page addr belongs to
+	// find all tc's in the page phys_addr belongs to
 	auto it_map = cpu_ctx->cpu->tc_page_map.find(phys_addr >> PAGE_SHIFT);
 	if (it_map != cpu_ctx->cpu->tc_page_map.end()) {
 		auto it_set = it_map->second.begin();
@@ -477,7 +458,6 @@ void tc_invalidate(cpu_ctx_t *cpu_ctx, addr_t addr, [[maybe_unused]] uint8_t siz
 							// the current tc cannot fault
 						}
 						cpu_ctx->cpu->code_cache[idx].erase(it);
-						cpu_ctx->cpu->num_tc--;
 						break;
 					}
 					it++;
@@ -502,15 +482,15 @@ void tc_invalidate(cpu_ctx_t *cpu_ctx, addr_t addr, [[maybe_unused]] uint8_t siz
 			it_map->second.erase(it);
 		}
 
-		// if the tc_page_map for addr is now empty, also clear TLB_CODE and its key in the map
+		// if the tc_page_map for phys_addr is now empty, also clear TLB_CODE and its key in the map
 		if (it_map->second.empty()) {
-			cpu_ctx->tlb[addr >> PAGE_SHIFT] &= ~TLB_CODE;
+			cpu_ctx->cpu->smc.reset(phys_addr >> PAGE_SHIFT);
 			cpu_ctx->cpu->tc_page_map.erase(it_map);
 		}
 	}
 
 	if (halt_tc) {
-		// in this case the tc we were executing has been destroyed and thus we must return to the translator with an exception
+		// in this case the tc we were executing must be interrupted and to do that, we must return to the translator with an exception
 		if constexpr (!remove_hook) {
 			cpu_ctx->regs.eip = eip;
 		}
@@ -518,10 +498,8 @@ void tc_invalidate(cpu_ctx_t *cpu_ctx, addr_t addr, [[maybe_unused]] uint8_t siz
 	}
 }
 
-template void tc_invalidate<true, true>(cpu_ctx_t * cpu_ctx, addr_t addr, [[maybe_unused]] uint8_t size, [[maybe_unused]] uint32_t eip);
-template void tc_invalidate<true, false>(cpu_ctx_t *cpu_ctx, addr_t addr, [[maybe_unused]] uint8_t size, [[maybe_unused]] uint32_t eip);
-template void tc_invalidate<false, true>(cpu_ctx_t * cpu_ctx, addr_t addr, [[maybe_unused]] uint8_t size, [[maybe_unused]] uint32_t eip);
-template void tc_invalidate<false, false>(cpu_ctx_t *cpu_ctx, addr_t addr, [[maybe_unused]] uint8_t size, [[maybe_unused]] uint32_t eip);
+template void tc_invalidate<true>(cpu_ctx_t * cpu_ctx, addr_t phys_addr, [[maybe_unused]] uint8_t size, [[maybe_unused]] uint32_t eip);
+template void tc_invalidate<false>(cpu_ctx_t * cpu_ctx, addr_t phys_addr, [[maybe_unused]] uint8_t size, [[maybe_unused]] uint32_t eip);
 
 static translated_code_t *
 tc_cache_search(cpu_t *cpu, addr_t pc)
@@ -554,16 +532,14 @@ template<bool should_flush_tlb>
 void tc_should_clear_cache_and_tlb(cpu_t *cpu, addr_t start, addr_t end)
 {
 	for (uint32_t tlb_idx_s = start >> PAGE_SHIFT, tlb_idx_e = end >> PAGE_SHIFT; tlb_idx_s <= tlb_idx_e; ++tlb_idx_s) {
-		if (cpu->cpu_ctx.tlb[tlb_idx_s] & TLB_CODE) {
+		if (cpu->smc[tlb_idx_s]) {
 			tc_cache_clear(cpu);
 			break;
 		}
 	}
 
 	if constexpr (should_flush_tlb) {
-		tlb_flush(cpu, TLB_zero);
-		cpu->cached_regions.clear();
-		cpu->cached_regions.push_back(nullptr);
+		tlb_flush(cpu);
 	}
 }
 
@@ -572,9 +548,9 @@ tc_cache_clear(cpu_t *cpu)
 {
 	// Use this when you want to destroy all tc's but without affecting the actual code allocated. E.g: on x86-64, you'll want to keep the .pdata sections
 	// when this is called from a function called from the JITed code, and the current function can potentially throw an exception
-	cpu->num_tc = 0;
 	cpu->tc_page_map.clear();
 	cpu->ibtc.clear();
+	cpu->smc.reset();
 	for (auto &bucket : cpu->code_cache) {
 		bucket.clear();
 	}
@@ -587,7 +563,8 @@ tc_cache_purge(cpu_t *cpu)
 	// necessary to unwind the stack of the JITed functions
 	tc_cache_clear(cpu);
 	cpu->jit->destroy_all_code();
-	cpu->jit->gen_int_fn();
+	cpu->jit->gen_aux_funcs();
+	cpu->num_tc = 0;
 }
 
 static void
@@ -665,6 +642,29 @@ link_indirect_handler(cpu_ctx_t *cpu_ctx, translated_code_t *tc)
 }
 
 static void
+halt_loop(cpu_t *cpu)
+{
+	while (true) {
+		uint32_t ret = cpu_timer_helper(&cpu->cpu_ctx);
+		_mm_pause();
+
+		if ((ret == CPU_NO_INT) || (ret == CPU_NON_HW_INT)) {
+			// either nothing changed or it's not a hw int, keep looping in both cases
+			continue;
+		}
+
+		if (ret == CPU_HW_INT) {
+			// hw int, exit the loop and clear the halted state
+			cpu->cpu_ctx.is_halted = 0;
+			return;
+		}
+
+		// timeout, exit the loop
+		return;
+	}
+}
+
+static void
 cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 {
 	cpu->translate_next = 1;
@@ -732,7 +732,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			case ZYDIS_STATUS_INSTRUCTION_TOO_LONG: {
 				// instruction length > 15 bytes
 				cpu->cpu_flags &= ~(CPU_DISAS_ONE | CPU_ALLOW_CODE_WRITE);
-				volatile addr_t addr = get_code_addr(cpu, disas_ctx->virt_pc + X86_MAX_INSTR_LENGTH, disas_ctx->virt_pc - cpu->cpu_ctx.regs.cs_hidden.base, TLB_CODE, disas_ctx);
+				volatile addr_t addr = get_code_addr<true>(cpu, disas_ctx->virt_pc + X86_MAX_INSTR_LENGTH, disas_ctx->virt_pc - cpu->cpu_ctx.regs.cs_hidden.base, disas_ctx);
 				if (disas_ctx->exp_data.idx == EXP_PF) {
 					disas_ctx->flags |= DISAS_FLG_FETCH_FAULT;
 					cpu->jit->gen_raise_exp_inline(disas_ctx->exp_data.fault_addr, disas_ctx->exp_data.code, disas_ctx->exp_data.idx, disas_ctx->exp_data.eip);
@@ -854,7 +854,10 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			break;
 
 		case ZYDIS_MNEMONIC_CLTS:        BAD;
-		case ZYDIS_MNEMONIC_CMC:         BAD;
+		case ZYDIS_MNEMONIC_CMC:
+			cpu->jit->cmc(&instr);
+			break;
+
 		case ZYDIS_MNEMONIC_CMOVB:
 		case ZYDIS_MNEMONIC_CMOVBE:
 		case ZYDIS_MNEMONIC_CMOVL:
@@ -884,8 +887,14 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			cpu->jit->cmps(&instr);
 			break;
 
-		case ZYDIS_MNEMONIC_CMPXCHG8B:   BAD;
-		case ZYDIS_MNEMONIC_CMPXCHG:     BAD;
+		case ZYDIS_MNEMONIC_CMPXCHG:
+			cpu->jit->cmpxchg(&instr);
+			break;
+
+		case ZYDIS_MNEMONIC_CMPXCHG8B:
+			cpu->jit->cmpxchg8b(&instr);
+			break;
+
 		case ZYDIS_MNEMONIC_CPUID:
 			cpu->jit->cpuid(&instr);
 			break;
@@ -914,7 +923,18 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			cpu->jit->div(&instr);
 			break;
 
-		case ZYDIS_MNEMONIC_ENTER: BAD;
+		case ZYDIS_MNEMONIC_ENTER:
+			cpu->jit->enter(&instr);
+			break;
+
+		case ZYDIS_MNEMONIC_FNINIT:
+			cpu->jit->fninit(&instr);
+			break;
+
+		case ZYDIS_MNEMONIC_FNSTSW:
+			cpu->jit->fnstsw(&instr);
+			break;
+
 		case ZYDIS_MNEMONIC_HLT:
 			cpu->jit->hlt(&instr);
 			break;
@@ -949,9 +969,15 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			cpu->jit->intn(&instr);
 			break;
 
-		case ZYDIS_MNEMONIC_INTO:        BAD;
+		case ZYDIS_MNEMONIC_INTO:
+			cpu->jit->into(&instr);
+			break;
+
 		case ZYDIS_MNEMONIC_INVD:        BAD;
-		case ZYDIS_MNEMONIC_INVLPG:      BAD;
+		case ZYDIS_MNEMONIC_INVLPG:
+			cpu->jit->invlpg(&instr);
+			break;
+
 		case ZYDIS_MNEMONIC_IRET:
 		case ZYDIS_MNEMONIC_IRETD:
 			cpu->jit->iret(&instr);
@@ -1088,9 +1114,16 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			cpu->jit->out(&instr);
 			break;
 
-		case ZYDIS_MNEMONIC_OUTSB:BAD;
-		case ZYDIS_MNEMONIC_OUTSD:BAD;
-		case ZYDIS_MNEMONIC_OUTSW:BAD;
+		case ZYDIS_MNEMONIC_OUTSB:
+		case ZYDIS_MNEMONIC_OUTSD:
+		case ZYDIS_MNEMONIC_OUTSW:
+			cpu->jit->outs(&instr);
+			break;
+
+		case ZYDIS_MNEMONIC_PAUSE:
+			// nothing to do
+			break;
+
 		case ZYDIS_MNEMONIC_POP:
 			cpu->jit->pop(&instr);
 			break;
@@ -1186,7 +1219,10 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			cpu->jit->setcc(&instr);
 			break;
 
-		case ZYDIS_MNEMONIC_SGDT:        BAD;
+		case ZYDIS_MNEMONIC_SGDT:
+			cpu->jit->sgdt(&instr);
+			break;
+
 		case ZYDIS_MNEMONIC_SHL:
 			cpu->jit->shl(&instr);
 			break;
@@ -1203,8 +1239,14 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			cpu->jit->shrd(&instr);
 			break;
 
-		case ZYDIS_MNEMONIC_SIDT:        BAD;
-		case ZYDIS_MNEMONIC_SLDT:        BAD;
+		case ZYDIS_MNEMONIC_SIDT:
+			cpu->jit->sidt(&instr);
+			break;
+
+		case ZYDIS_MNEMONIC_SLDT:
+			cpu->jit->sldt(&instr);
+			break;
+
 		case ZYDIS_MNEMONIC_SMSW:        BAD;
 		case ZYDIS_MNEMONIC_STC:
 			cpu->jit->stc(&instr);
@@ -1224,7 +1266,10 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			cpu->jit->stos(&instr);
 			break;
 
-		case ZYDIS_MNEMONIC_STR:         BAD;
+		case ZYDIS_MNEMONIC_STR:
+			cpu->jit->str(&instr);
+			break;
+
 		case ZYDIS_MNEMONIC_SUB:
 			cpu->jit->sub(&instr);
 			break;
@@ -1253,18 +1298,24 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			cpu->jit->wrmsr(&instr);
 			break;
 
-		case ZYDIS_MNEMONIC_XADD:        BAD;
+		case ZYDIS_MNEMONIC_XADD:
+			cpu->jit->xadd(&instr);
+			break;
+
 		case ZYDIS_MNEMONIC_XCHG:
 			cpu->jit->xchg(&instr);
 			break;
 
-		case ZYDIS_MNEMONIC_XLAT:        BAD;
+		case ZYDIS_MNEMONIC_XLAT:
+			cpu->jit->xlat(&instr);
+			break;
+
 		case ZYDIS_MNEMONIC_XOR:
 			cpu->jit->xor_(&instr);
 			break;
 
 		default:
-			LIB86CPU_ABORT();
+			BAD;
 		}
 
 		cpu->virt_pc += cpu->instr_bytes;
@@ -1287,20 +1338,12 @@ cpu_do_int(cpu_ctx_t *cpu_ctx, uint32_t int_flg)
 		cpu_t *cpu = cpu_ctx->cpu;
 		if (int_flg & CPU_A20_INT) {
 			cpu->a20_mask = cpu->new_a20;
-			tlb_flush(cpu, TLB_zero);
-			cpu->cached_regions.clear();
-			cpu->cached_regions.push_back(nullptr);
+			tlb_flush(cpu);
 			tc_cache_clear(cpu);
 			if (int_flg & CPU_REGION_INT) {
 				// the a20 interrupt has already flushed the tlb and the code cache, so just update the as object
 				std::for_each(cpu->regions_changed.begin(), cpu->regions_changed.end(), [cpu](auto &pair) {
 					if (pair.first) {
-						if (pair.second->type == mem_type::ram) {
-							if (auto ram = as_memory_search_addr(cpu, cpu->ram_start); ram->type == mem_type::ram) {
-								cpu->memory_space_tree->erase(ram->start, ram->end);
-							}
-							cpu->ram_start = pair.second->start;
-						}
 						cpu->memory_space_tree->insert(std::move(pair.second));
 					}
 					else {
@@ -1314,12 +1357,6 @@ cpu_do_int(cpu_ctx_t *cpu_ctx, uint32_t int_flg)
 			std::for_each(cpu->regions_changed.begin(), cpu->regions_changed.end(), [cpu](auto &pair) {
 				addr_t start = pair.second->start, end = pair.second->end;
 				if (pair.first) {
-					if (pair.second->type == mem_type::ram) {
-						if (auto ram = as_memory_search_addr(cpu, cpu->ram_start); ram->type == mem_type::ram) {
-							cpu->memory_space_tree->erase(ram->start, ram->end);
-						}
-						cpu->ram_start = pair.second->start;
-					}
 					cpu->memory_space_tree->insert(std::move(pair.second));
 				}
 				else {
@@ -1328,11 +1365,10 @@ cpu_do_int(cpu_ctx_t *cpu_ctx, uint32_t int_flg)
 				// avoid flushing the tlb and subpages for every region, but instead only do it once outside the loop
 				tc_should_clear_cache_and_tlb<false>(cpu, start, end);
 			});
-			tlb_flush(cpu, TLB_zero);
-			cpu->cached_regions.clear();
-			cpu->cached_regions.push_back(nullptr);
+			tlb_flush(cpu);
 			cpu->regions_changed.clear();
 		}
+		return CPU_NON_HW_INT;
 	}
 
 	if (((int_flg & CPU_HW_INT) | (cpu_ctx->regs.eflags & IF_MASK)) == (IF_MASK | CPU_HW_INT)) {
@@ -1341,10 +1377,10 @@ cpu_do_int(cpu_ctx_t *cpu_ctx, uint32_t int_flg)
 		cpu_ctx->exp_info.exp_data.idx = cpu_ctx->cpu->get_int_vec();
 		cpu_ctx->exp_info.exp_data.eip = cpu_ctx->regs.eip;
 		cpu_raise_exception<false, true>(cpu_ctx);
-		return 1;
+		return CPU_HW_INT;
 	}
 
-	return 0;
+	return CPU_NO_INT;
 }
 
 // forward declare for cpu_main_loop
@@ -1552,10 +1588,6 @@ tc_run_code(cpu_ctx_t *cpu_ctx, translated_code_t *tc)
 			return nullptr;
 		}
 
-		case host_exp_t::cpu_mode_changed:
-			tc_cache_purge(cpu_ctx->cpu);
-			[[fallthrough]];
-
 		case host_exp_t::halt_tc:
 			return nullptr;
 
@@ -1590,7 +1622,7 @@ lc86_status cpu_start(cpu_t *cpu)
 			cpu->cpu_ctx.exit_requested = 0;
 			if (cpu->cpu_ctx.is_halted) {
 				// if the cpu was previously halted, then we must keep waiting until the next hw int
-				cpu->jit->halt_loop();
+				halt_loop(cpu);
 				if (cpu->cpu_ctx.is_halted) {
 					// if it is still halted, then it must be a timeout
 					cpu->cpu_ctx.hflags &= ~HFLG_TIMEOUT;

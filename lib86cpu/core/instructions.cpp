@@ -233,7 +233,15 @@ uint32_t lret_pe_helper(cpu_ctx_t *cpu_ctx, uint8_t size_mode, uint32_t eip)
 		// same privilege
 
 		set_access_flg_seg_desc_helper(cpu, cs_desc, desc_addr, eip);
-		cpu->cpu_ctx.regs.esp = esp;
+
+		uint32_t stack_mask;
+		if (cpu->cpu_ctx.hflags & HFLG_SS32) {
+			stack_mask = 0xFFFFFFFF;
+		}
+		else {
+			stack_mask = 0xFFFF;
+		}
+		cpu->cpu_ctx.regs.esp = (cpu->cpu_ctx.regs.esp & ~stack_mask) | (esp & stack_mask);
 		cpu->cpu_ctx.regs.eip = ret_eip;
 		write_seg_reg_helper<CS_idx>(cpu, cs, read_seg_desc_base_helper(cpu, cs_desc), read_seg_desc_limit_helper(cpu, cs_desc), read_seg_desc_flags_helper(cpu, cs_desc));
 	}
@@ -263,7 +271,7 @@ iret_real_helper(cpu_ctx_t *cpu_ctx, uint8_t size_mode, uint32_t eip)
 		eflags_mask = ID_MASK | AC_MASK | RF_MASK | NT_MASK | IOPL_MASK | DF_MASK | IF_MASK | TF_MASK;
 	}
 
-	cpu->cpu_ctx.regs.esp = esp;
+	cpu->cpu_ctx.regs.esp = (cpu->cpu_ctx.regs.esp & ~0xFFFF) | (esp & 0xFFFF);
 	cpu_ctx->regs.eip = ret_eip;
 	cpu_ctx->regs.cs = cs;
 	cpu_ctx->regs.cs_hidden.base = cs << 4;
@@ -531,36 +539,36 @@ lcall_pe_helper(cpu_ctx_t *cpu_ctx, uint16_t sel, uint32_t call_eip, uint8_t siz
 			if (sys_ty) { // 32 bit push
 				eip_mask = 0xFFFFFFFF;
 				esp -= 4;
-				mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.ss, eip, 2); // push ss
+				mem_write_helper<uint32_t>(cpu_ctx, stack_base + (esp & stack_mask), cpu_ctx->regs.ss, eip, 2); // push ss
 				esp -= 4;
-				mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.esp, eip, 2); // push esp
+				mem_write_helper<uint32_t>(cpu_ctx, stack_base + (esp & stack_mask), cpu_ctx->regs.esp, eip, 2); // push esp
 				while (i >= 0) {
-					uint32_t param32 = mem_read<uint32_t>(cpu, cpu_ctx->regs.ss_hidden.base + ((cpu_ctx->regs.esp + i * 4) & stack_mask), eip, 2); // read param from src stack
+					uint32_t param32 = mem_read_helper<uint32_t>(cpu_ctx, cpu_ctx->regs.ss_hidden.base + ((cpu_ctx->regs.esp + i * 4) & stack_mask), eip, 2); // read param from src stack
 					esp -= 4;
-					mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), param32, eip, 2); // push param to dst stack
+					mem_write_helper<uint32_t>(cpu_ctx, stack_base + (esp & stack_mask), param32, eip, 2); // push param to dst stack
 					--i;
 				}
 				esp -= 4;
-				mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 2); // push cs
+				mem_write_helper<uint32_t>(cpu_ctx, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 2); // push cs
 				esp -= 4;
-				mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), ret_eip, eip, 2); // push eip
+				mem_write_helper<uint32_t>(cpu_ctx, stack_base + (esp & stack_mask), ret_eip, eip, 2); // push eip
 			}
 			else { // 16 bit push
 				eip_mask = 0xFFFF;
 				esp -= 2;
-				mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.ss, eip, 2); // push ss
+				mem_write_helper<uint16_t>(cpu_ctx, stack_base + (esp & stack_mask), cpu_ctx->regs.ss, eip, 2); // push ss
 				esp -= 2;
-				mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.esp, eip, 2); // push sp
+				mem_write_helper<uint16_t>(cpu_ctx, stack_base + (esp & stack_mask), cpu_ctx->regs.esp, eip, 2); // push sp
 				while (i >= 0) {
-					uint16_t param16 = mem_read<uint16_t>(cpu, cpu_ctx->regs.ss_hidden.base + ((cpu_ctx->regs.esp + i * 2) & stack_mask), eip, 2); // read param from src stack
+					uint16_t param16 = mem_read_helper<uint16_t>(cpu_ctx, cpu_ctx->regs.ss_hidden.base + ((cpu_ctx->regs.esp + i * 2) & stack_mask), eip, 2); // read param from src stack
 					esp -= 2;
-					mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), param16, eip, 2); // push param to dst stack
+					mem_write_helper<uint16_t>(cpu_ctx, stack_base + (esp & stack_mask), param16, eip, 2); // push param to dst stack
 					--i;
 				}
 				esp -= 2;
-				mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 2); // push cs
+				mem_write_helper<uint16_t>(cpu_ctx, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 2); // push cs
 				esp -= 2;
-				mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), ret_eip, eip, 2); // push ip
+				mem_write_helper<uint16_t>(cpu_ctx, stack_base + (esp & stack_mask), ret_eip, eip, 2); // push ip
 			}
 
 			set_access_flg_seg_desc_helper(cpu, ss_desc, ss_desc_addr, eip);
@@ -575,16 +583,16 @@ lcall_pe_helper(cpu_ctx_t *cpu_ctx, uint16_t sel, uint32_t call_eip, uint8_t siz
 			if (sys_ty) { // 32 bit push
 				eip_mask = 0xFFFFFFFF;
 				esp -= 4;
-				mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 0); // push cs
+				mem_write_helper<uint32_t>(cpu_ctx, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 0); // push cs
 				esp -= 4;
-				mem_write<uint32_t>(cpu, stack_base + (esp & stack_mask), ret_eip, eip, 0); // push eip
+				mem_write_helper<uint32_t>(cpu_ctx, stack_base + (esp & stack_mask), ret_eip, eip, 0); // push eip
 			}
 			else { // 16 bit push
 				eip_mask = 0xFFFF;
 				esp -= 2;
-				mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 0); // push cs
+				mem_write_helper<uint16_t>(cpu_ctx, stack_base + (esp & stack_mask), cpu_ctx->regs.cs, eip, 0); // push cs
 				esp -= 2;
-				mem_write<uint16_t>(cpu, stack_base + (esp & stack_mask), ret_eip, eip, 0); // push ip
+				mem_write_helper<uint16_t>(cpu_ctx, stack_base + (esp & stack_mask), ret_eip, eip, 0); // push ip
 			}
 		}
 
@@ -672,7 +680,7 @@ void verrw_helper(cpu_ctx_t *cpu_ctx, uint16_t sel, uint32_t eip)
 	}
 
 	uint32_t sfd = (cpu_ctx->lazy_eflags.result >> 31) ^ (cpu_ctx->lazy_eflags.auxbits & 1);
-	uint32_t pdb = (cpu_ctx->lazy_eflags.result ^ (cpu_ctx->lazy_eflags.auxbits >> 8) & 0xFF) << 8;
+	uint32_t pdb = ((cpu_ctx->lazy_eflags.result << 8) ^ cpu_ctx->lazy_eflags.auxbits) & 0xFF00;
 	cpu_ctx->lazy_eflags.result = 0;
 	cpu_ctx->lazy_eflags.auxbits = (cpu_ctx->lazy_eflags.auxbits & 0xFFFF00FE) | (sfd | pdb);
 }
@@ -702,7 +710,7 @@ ltr_helper(cpu_ctx_t *cpu_ctx, uint16_t sel, uint32_t eip)
 		return raise_exp_helper(cpu, sel & 0xFFFC, EXP_NP, eip);
 	}
 
-	mem_write<uint64_t>(cpu, desc_addr, desc | SEG_DESC_BY, eip, 2);
+	mem_write_helper<uint64_t>(cpu_ctx, desc_addr, desc | SEG_DESC_BY, eip, 2);
 	write_seg_reg_helper<TR_idx>(cpu, sel, read_seg_desc_base_helper(cpu, desc), read_seg_desc_limit_helper(cpu, desc), read_seg_desc_flags_helper(cpu, desc));
 
 	return 0;
@@ -740,7 +748,7 @@ lldt_helper(cpu_ctx_t *cpu_ctx, uint16_t sel, uint32_t eip)
 }
 
 uint32_t
-update_crN_helper(cpu_ctx_t *cpu_ctx, uint32_t new_cr, uint8_t idx, uint32_t eip, uint32_t bytes)
+update_crN_helper(cpu_ctx_t *cpu_ctx, uint32_t new_cr, uint8_t idx)
 {
 	switch (idx)
 	{
@@ -751,9 +759,15 @@ update_crN_helper(cpu_ctx_t *cpu_ctx, uint32_t new_cr, uint8_t idx, uint32_t eip
 		}
 
 		cpu_ctx->hflags = (((new_cr & CR0_EM_MASK) << 3) | (cpu_ctx->hflags & ~HFLG_CR0_EM));
+		cpu_ctx->hflags = (((new_cr & CR0_TS_MASK) << 7) | (cpu_ctx->hflags & ~HFLG_CR0_TS));
+
+		// only flush the tlb if pg changed or wp changed and pg=1
+		if (((cpu_ctx->regs.cr0 & CR0_PG_MASK) != (new_cr & CR0_PG_MASK)) ||
+			(((cpu_ctx->regs.cr0 & CR0_WP_MASK) != (new_cr & CR0_WP_MASK)) && (new_cr & CR0_PG_MASK))) {
+			tlb_flush(cpu_ctx->cpu);
+		}
 
 		if ((cpu_ctx->regs.cr0 & CR0_PE_MASK) != (new_cr & CR0_PE_MASK)) {
-			tlb_flush(cpu_ctx->cpu, TLB_zero);
 			if (new_cr & CR0_PE_MASK) {
 				// real -> protected
 				if (cpu_ctx->regs.cs_hidden.flags & SEG_HIDDEN_DB) {
@@ -777,28 +791,18 @@ update_crN_helper(cpu_ctx_t *cpu_ctx, uint32_t new_cr, uint8_t idx, uint32_t eip
 				break_list.clear();
 				LOG(log_level::info, "Removed all breakpoints because cpu mode changed");
 			}
-
-			cpu_ctx->regs.eip = (eip + bytes);
-			cpu_ctx->regs.cr0 = ((new_cr & CR0_FLG_MASK) | CR0_ET_MASK);
-			throw host_exp_t::cpu_mode_changed;
 		}
 
-		if ((cpu_ctx->regs.cr0 & (CR0_WP_MASK | CR0_PG_MASK)) != (new_cr & (CR0_WP_MASK | CR0_PG_MASK))) {
-			tlb_flush(cpu_ctx->cpu, TLB_keep_cw);
-		}
-
-		// mov cr0, reg always terminates the tc, so we must update the eip here
-		cpu_ctx->regs.eip = (eip + bytes);
 		cpu_ctx->regs.cr0 = ((new_cr & CR0_FLG_MASK) | CR0_ET_MASK);
 		break;
 
 	case 3:
 		if (cpu_ctx->regs.cr0 & CR0_PG_MASK) {
 			if (cpu_ctx->regs.cr4 & CR4_PGE_MASK) {
-				tlb_flush(cpu_ctx->cpu, TLB_no_g);
+				tlb_flush<false>(cpu_ctx->cpu);
 			}
 			else {
-				tlb_flush(cpu_ctx->cpu, TLB_keep_cw);
+				tlb_flush(cpu_ctx->cpu);
 			}
 		}
 
@@ -815,7 +819,7 @@ update_crN_helper(cpu_ctx_t *cpu_ctx, uint32_t new_cr, uint8_t idx, uint32_t eip
 		}
 
 		if ((cpu_ctx->regs.cr4 & (CR4_PSE_MASK | CR4_PGE_MASK)) != (new_cr & (CR4_PSE_MASK | CR4_PGE_MASK))) {
-			tlb_flush(cpu_ctx->cpu, TLB_keep_cw);
+			tlb_flush(cpu_ctx->cpu);
 		}
 
 		cpu_ctx->regs.cr4 = new_cr;
@@ -835,51 +839,32 @@ update_drN_helper(cpu_ctx_t *cpu_ctx, uint8_t dr_idx, uint32_t new_dr)
 {
 	switch (dr_idx)
 	{
-	case DR0_idx:
-	case DR1_idx:
-	case DR2_idx:
-	case DR3_idx: {
-		// flush the old tlb/iotable entry, so mem accesses there will call the mem helpers and check for possible watchpoints on the same page
-		// as the old one from the other dr regs, then set the new watchpoint in all dr regs if enabled
-		if (cpu_get_watchpoint_type(cpu_ctx->cpu, dr_idx - DR_offset) == DR7_TYPE_IO_RW) {
-			if (cpu_ctx->regs.cr4 & CR4_DE_MASK) {
-				uint32_t dr = cpu_ctx->regs.dr[dr_idx - DR_offset];
-				size_t wp_len = cpu_get_watchpoint_lenght(cpu_ctx->cpu, dr_idx - DR_offset);
-				for (size_t idx = 0; idx < wp_len; ++idx) {
-					cpu_ctx->cpu->iotable.reset(dr & 0xFFFF);
-					++dr;
-				}
-				cpu_ctx->regs.dr[dr_idx - DR_offset] = new_dr;
-				for (int idx = 0; idx < 4; ++idx) {
-					if (cpu_check_watchpoint_enabled(cpu_ctx->cpu, idx)) {
-						wp_len = cpu_get_watchpoint_lenght(cpu_ctx->cpu, idx);
-						for (size_t idx = 0; idx < wp_len; ++idx) {
-							cpu_ctx->cpu->iotable.set(cpu_ctx->regs.dr[idx] & 0xFFFF);
-							++dr;
-						}
+	case 0:
+	case 1:
+	case 2:
+	case 3: {
+		// if the watchpoint is disabled, then don't do anything, otherwise update it in the wp_data/wp_io struct
+		cpu_ctx->regs.dr[dr_idx] = new_dr;
+		if (cpu_get_watchpoint_type(cpu_ctx->cpu, dr_idx) == DR7_TYPE_IO_RW) {
+			if (cpu_check_watchpoint_enabled(cpu_ctx->cpu, dr_idx) && (cpu_ctx->regs.cr4 & CR4_DE_MASK)) {
+				for (auto &io : cpu_ctx->cpu->wp_io) {
+					if (io.dr_idx == dr_idx) {
+						size_t watch_len = cpu_get_watchpoint_lenght(cpu_ctx->cpu, dr_idx);
+						io.watch_addr = cpu_ctx->regs.dr[dr_idx] & ~(watch_len - 1);
+						io.watch_end = io.watch_addr + watch_len - 1;
+						break;
 					}
 				}
 			}
 		}
 		else {
-			uint32_t dr = cpu_ctx->regs.dr[dr_idx - DR_offset];
-			size_t wp_len = cpu_get_watchpoint_lenght(cpu_ctx->cpu, dr_idx - DR_offset);
-			uint32_t tlb_idx1 = dr >> PAGE_SHIFT;
-			uint32_t tlb_idx2 = (dr + wp_len - 1) >> PAGE_SHIFT;
-			cpu_ctx->tlb[tlb_idx1] &= ~TLB_WATCH;
-			if (tlb_idx1 != tlb_idx2) {
-				cpu_ctx->tlb[tlb_idx2] &= ~TLB_WATCH;
-			}
-			cpu_ctx->regs.dr[dr_idx - DR_offset] = new_dr;
-			for (int idx = 0; idx < 4; ++idx) {
-				if (cpu_check_watchpoint_enabled(cpu_ctx->cpu, idx)) {
-					wp_len = cpu_get_watchpoint_lenght(cpu_ctx->cpu, idx);
-					dr = cpu_ctx->regs.dr[idx];
-					tlb_idx1 = dr >> PAGE_SHIFT;
-					tlb_idx2 = (dr + wp_len - 1) >> PAGE_SHIFT;
-					cpu_ctx->tlb[tlb_idx1] |= TLB_WATCH;
-					if (tlb_idx1 != tlb_idx2) {
-						cpu_ctx->tlb[tlb_idx2] |= TLB_WATCH;
+			if (cpu_check_watchpoint_enabled(cpu_ctx->cpu, dr_idx)) {
+				for (auto &data : cpu_ctx->cpu->wp_data) {
+					if (data.dr_idx == dr_idx) {
+						size_t watch_len = cpu_get_watchpoint_lenght(cpu_ctx->cpu, dr_idx);
+						data.watch_addr = cpu_ctx->regs.dr[dr_idx] & ~(watch_len - 1);
+						data.watch_end = data.watch_addr + watch_len - 1;
+						break;
 					}
 				}
 			}
@@ -887,8 +872,37 @@ update_drN_helper(cpu_ctx_t *cpu_ctx, uint8_t dr_idx, uint32_t new_dr)
 	}
 	break;
 
+	case 7: {
+		// clear all watchpoints, and if it's disabled, then don't do anything, otherwise add it to the struct
+		cpu_ctx->cpu->wp_io.clear();
+		cpu_ctx->cpu->wp_data.clear();
+		cpu_ctx->regs.dr[7] = new_dr;
+		for (unsigned idx = 0; idx < 4; ++idx) {
+			if (cpu_check_watchpoint_enabled(cpu_ctx->cpu, idx)) {
+				size_t watch_len = cpu_get_watchpoint_lenght(cpu_ctx->cpu, idx);
+				if (cpu_get_watchpoint_type(cpu_ctx->cpu, idx) == DR7_TYPE_IO_RW) {
+					port_t watch_addr = cpu_ctx->regs.dr[idx] & ~(watch_len - 1);
+					port_t watch_end = watch_addr + watch_len - 1;
+					cpu_ctx->cpu->wp_io.emplace_back(idx, watch_addr, watch_end);
+				}
+				else {
+					addr_t watch_addr = cpu_ctx->regs.dr[idx] & ~(watch_len - 1);
+					addr_t watch_end = watch_addr + watch_len - 1;
+					cpu_ctx->cpu->wp_data.emplace_back(idx, watch_addr, watch_end);
+				}
+			}
+		}
+	}
+	break;
+
+	case 4:
+	case 5:
+	case 6:
+		// the other dr regs are handled by the jit
+		assert(0);
+		[[fallthrough]];
+
 	default:
-		// the other dr regs are handled by the jit for now
 		LIB86CPU_ABORT();
 	}
 }
@@ -902,6 +916,14 @@ msr_read_helper(cpu_ctx_t *cpu_ctx)
 	{
 	case IA32_APIC_BASE:
 		val = MSR_IA32_APICBASE_BSP;
+		break;
+
+	case IA32_BIOS_UPDT_TRIG:
+		val = 0;
+		break;
+
+	case IA32_BIOS_SIGN_ID:
+		val = cpu_ctx->cpu->msr.bios_sign_id;
 		break;
 
 	case IA32_MTRRCAP:
@@ -975,6 +997,17 @@ msr_write_helper(cpu_ctx_t *cpu_ctx)
 		if (val & MSR_IA32_APIC_BASE_RES) {
 			return 1;
 		}
+		break;
+
+	case IA32_BIOS_UPDT_TRIG:
+		cpu_ctx->cpu->microcode_updated = 1;
+		break;
+
+	case IA32_BIOS_SIGN_ID:
+		if (val & MSR_BIOS_SIGN_ID_RES) {
+			return 1;
+		}
+		cpu_ctx->cpu->msr.bios_sign_id = val;
 		break;
 
 	case IA32_MTRRCAP:
@@ -1179,6 +1212,9 @@ cpuid_helper(cpu_ctx_t *cpu_ctx)
 		cpu_ctx->regs.ebx = 0;
 		cpu_ctx->regs.edx = 0x0383F9FF; // fpu, vme, de, pse, tsc, msr, pae, mce, cx8, sep, mtrr, pge, mca, cmov, pat, pse-36, mmx, fxsr, sse
 		cpu_ctx->regs.ecx = 0;
+		if (cpu_ctx->cpu->microcode_updated) {
+			cpu_ctx->cpu->msr.bios_sign_id = INTEL_MICROCODE_ID;
+		}
 		break;
 
 	case 0:

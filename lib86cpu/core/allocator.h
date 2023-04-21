@@ -33,7 +33,7 @@ public:
 	void destroy_all_blocks();
 	~mem_manager() { destroy_all_blocks(); }
 
-#if defined(_WIN64)
+#if defined(_WIN64) || defined(__linux__)
 	std::map<void *, void *> eh_frames;
 #endif
 

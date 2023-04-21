@@ -10,7 +10,19 @@
 #include <unordered_set>
 #include <bitset>
 #include <random>
+#include <memory>
+#include <list>
+#include <cinttypes>
 #include "lib86cpu.h"
+
+#ifdef LIB86CPU_X64_EMITTER
+#ifdef _MSC_VER
+#  define MS_ABI /* Nothing */
+#else
+#  define MS_ABI __attribute__((__ms_abi__))
+#endif
+#  define JIT_API MS_ABI
+#endif
 
 
 #define CODE_CACHE_MAX_SIZE (1 << 15)
@@ -42,7 +54,7 @@ enum class mem_type {
 
 enum class host_exp_t : int {
 	pf_exp,
-	de_exp,
+	db_exp,
 	halt_tc,
 };
 
@@ -83,11 +95,10 @@ struct exp_info_t {
 
 struct cpu_ctx_t;
 struct translated_code_t;
-using entry_t = translated_code_t *(*)(cpu_ctx_t *cpu_ctx);
-using read_int_t = uint32_t (*)(cpu_ctx_t *cpu_ctx);
-using clear_int_t = void (*)(cpu_ctx_t *cpu_ctx);
-using raise_int_t = void (*)(cpu_ctx_t *cpu_ctx, uint32_t int_flg);
-using set_fctrl_t = void (*)(uint16_t fctrl_val);
+using entry_t = translated_code_t *(JIT_API *)(cpu_ctx_t *cpu_ctx);
+using read_int_t = uint32_t(JIT_API *)(cpu_ctx_t *cpu_ctx);
+using clear_int_t = void(JIT_API *)(cpu_ctx_t *cpu_ctx);
+using raise_int_t = void(JIT_API *)(cpu_ctx_t *cpu_ctx, uint32_t int_flg);
 
 // jmp_offset functions: 0,1 -> used for direct linking (either points to exit or &next_tc), 2 -> exit
 struct translated_code_t {
@@ -98,15 +109,17 @@ struct translated_code_t {
 	uint32_t guest_flags;
 	entry_t ptr_code;
 	entry_t jmp_offset[3];
+	translated_code_t *ibtc[3];
 	uint32_t flags;
 	uint32_t size;
 	explicit translated_code_t() noexcept;
+	explicit translated_code_t(uint32_t flags) noexcept : translated_code_t() { guest_flags = flags; }
 };
 
 struct disas_ctx_t {
 	uint8_t flags;
 	addr_t virt_pc, pc;
-	size_t instr_buff_size;
+	uint64_t instr_buff_size;
 	exp_data_t exp_data;
 };
 
@@ -130,8 +143,9 @@ struct lazy_eflags_t {
 };
 
 struct fpu_data_t {
-	uint16_t ftss; // these are the top of stack pointer bits of fstatus
+	uint16_t ftop; // these are the top of stack pointer bits of fstatus
 	uint16_t fes; // pending unmasked exception flag that is, es bit of fstatus
+	uint16_t frp; // current rounding and precision set in fctrl | FPU_EXP_ALL
 };
 
 // this struct should contain all cpu variables which need to be visible from the jitted code
@@ -156,6 +170,7 @@ struct cpu_t {
 	uint32_t cpu_flags;
 	const char *cpu_name;
 	cpu_ctx_t cpu_ctx;
+	disas_ctx_t disas_ctx;
 	translated_code_t *tc; // tc for which we are currently generating code
 	std::mt19937 rng_gen;
 	std::unique_ptr<lc86_jit> jit;
@@ -163,8 +178,7 @@ struct cpu_t {
 	std::unique_ptr<address_space<port_t>> io_space_tree;
 	std::list<std::unique_ptr<translated_code_t>> code_cache[CODE_CACHE_MAX_SIZE];
 	std::unordered_map<uint32_t, std::unordered_set<translated_code_t *>> tc_page_map;
-	std::unordered_map<addr_t, translated_code_t *> ibtc;
-	std::unordered_map<addr_t, void *> hook_map;
+	std::unordered_map<addr_t, hook_t> hook_map;
 	std::vector<wp_info<addr_t>> wp_data;
 	std::vector<wp_info<port_t>> wp_io;
 	std::vector<std::pair<bool, std::unique_ptr<memory_region_t<addr_t>>>> regions_changed;
@@ -173,11 +187,11 @@ struct cpu_t {
 	tlb_t dtlb[DTLB_NUM_SETS][DTLB_NUM_LINES]; // data tlb
 	uint16_t num_tc; // num of tc actually emitted, tc's might not be present in the code cache
 	uint8_t microcode_updated;
-	struct {
+	struct _tsc_clock {
 		uint64_t last_host_ticks;
 		static constexpr uint64_t cpu_freq = 733333333;
 	} tsc_clock;
-	struct {
+	struct _timer {
 		uint64_t last_time;
 		uint64_t host_freq;
 		uint64_t timeout_time;
@@ -187,7 +201,6 @@ struct cpu_t {
 	clear_int_t clear_int_fn;
 	raise_int_t raise_int_fn;
 	clear_int_t lower_hw_int_fn;
-	set_fctrl_t set_fctrl_fn;
 	fp_int get_int_vec;
 	std::string dbg_name;
 	addr_t bp_addr;

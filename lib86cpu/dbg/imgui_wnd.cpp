@@ -75,7 +75,7 @@ dbg_draw_imgui_wnd(cpu_t *cpu)
 						instr_sel = 0;
 						const char *text = "Not available while debuggee is running";
 						ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() / 2 - (ImGui::CalcTextSize(text).x / 2), ImGui::GetWindowHeight() / 2 - (ImGui::CalcTextSize(text).y / 2)));
-						ImGui::Text(text);
+						ImGui::Text("%s", text);
 						guest_running.test_and_set();
 						guest_running.notify_one();
 					}
@@ -133,7 +133,7 @@ dbg_draw_imgui_wnd(cpu_t *cpu)
 					dbg_apply_sw_breakpoints(cpu);
 					const char *text = "Not available while debuggee is running";
 					ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() / 2 - (ImGui::CalcTextSize(text).x / 2), ImGui::GetWindowHeight() / 2 - (ImGui::CalcTextSize(text).y / 2)));
-					ImGui::Text(text);
+					ImGui::Text("%s", text);
 					guest_running.test_and_set();
 					guest_running.notify_one();
 				}
@@ -155,7 +155,7 @@ dbg_draw_imgui_wnd(cpu_t *cpu)
 		else {
 			const char *text = "Not available while debuggee is running";
 			ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() / 2 - (ImGui::CalcTextSize(text).x / 2), ImGui::GetWindowHeight() / 2 - (ImGui::CalcTextSize(text).y / 2)));
-			ImGui::Text(text);
+			ImGui::Text("%s", text);
 		}
 		ImGui::EndChild();
 	}
@@ -190,7 +190,7 @@ dbg_draw_imgui_wnd(cpu_t *cpu)
 		else {
 			const char *text = "Not available while debuggee is running";
 			ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() / 2 - (ImGui::CalcTextSize(text).x / 2), ImGui::GetWindowHeight() / 2 - (ImGui::CalcTextSize(text).y / 2)));
-			ImGui::Text(text);
+			ImGui::Text("%s", text);
 		}
 		ImGui::EndChild();
 	}
@@ -277,43 +277,64 @@ dbg_draw_imgui_wnd(cpu_t *cpu)
 				cpu->cpu_ctx.regs.dr[6],
 				cpu->cpu_ctx.regs.dr[7]
 			);
-			ImGui::Text("r0.h: 0x%04hX  r0.l: 0x%016llX  r1.h: 0x%04hX  r1.l: 0x%016llX  r2.h: 0x%04hX  r2.l: 0x%016llX  r3.h: 0x%04hX  r3.l: 0x%016llX",
-				cpu->cpu_ctx.regs.r0.high,
-				cpu->cpu_ctx.regs.r0.low,
-				cpu->cpu_ctx.regs.r1.high,
-				cpu->cpu_ctx.regs.r1.low,
-				cpu->cpu_ctx.regs.r2.high,
-				cpu->cpu_ctx.regs.r2.low,
-				cpu->cpu_ctx.regs.r3.high,
-				cpu->cpu_ctx.regs.r3.low
+			ImGui::Text("r0.h: 0x%04hX  r0.l: 0x%016" PRIX64 "  r1.h: 0x%04hX  r1.l: 0x%016" PRIX64 "  r2.h: 0x%04hX  r2.l: 0x%016" PRIX64 "  r3.h: 0x%04hX  r3.l: 0x%016" PRIX64,
+				cpu->cpu_ctx.regs.fr[0].high,
+				cpu->cpu_ctx.regs.fr[0].low,
+				cpu->cpu_ctx.regs.fr[1].high,
+				cpu->cpu_ctx.regs.fr[1].low,
+				cpu->cpu_ctx.regs.fr[2].high,
+				cpu->cpu_ctx.regs.fr[2].low,
+				cpu->cpu_ctx.regs.fr[3].high,
+				cpu->cpu_ctx.regs.fr[3].low
 			);
-			ImGui::Text("r4.h: 0x%04hX  r4.l: 0x%016llX  r5.h: 0x%04hX  r5.l: 0x%016llX  r6.h: 0x%04hX  r6.l: 0x%016llX  r7.h: 0x%04hX  r7.l: 0x%016llX",
-				cpu->cpu_ctx.regs.r4.high,
-				cpu->cpu_ctx.regs.r4.low,
-				cpu->cpu_ctx.regs.r5.high,
-				cpu->cpu_ctx.regs.r5.low,
-				cpu->cpu_ctx.regs.r6.high,
-				cpu->cpu_ctx.regs.r6.low,
-				cpu->cpu_ctx.regs.r7.high,
-				cpu->cpu_ctx.regs.r7.low
+			ImGui::Text("r4.h: 0x%04hX  r4.l: 0x%016" PRIX64 "  r5.h: 0x%04hX  r5.l: 0x%016" PRIX64 "  r6.h: 0x%04hX  r6.l: 0x%016" PRIX64 "  r7.h: 0x%04hX  r7.l: 0x%016" PRIX64,
+				cpu->cpu_ctx.regs.fr[4].high,
+				cpu->cpu_ctx.regs.fr[4].low,
+				cpu->cpu_ctx.regs.fr[5].high,
+				cpu->cpu_ctx.regs.fr[5].low,
+				cpu->cpu_ctx.regs.fr[6].high,
+				cpu->cpu_ctx.regs.fr[6].low,
+				cpu->cpu_ctx.regs.fr[7].high,
+				cpu->cpu_ctx.regs.fr[7].low
 			);
 			ImGui::Text("fctrl: 0x%04hX  fstatus: 0x%04hX  ftags: 0x%04hX",
 				cpu->cpu_ctx.regs.fctrl,
 				read_fstatus(cpu),
 				read_ftags(cpu)
 			);
-			ImGui::Text("fcs: 0x%04hX  fip: 0x%08hX  fds: 0x%04hX  fdp: 0x%08hX  fop: 0x%04hX",
+			ImGui::Text("fcs: 0x%04hX  fip: 0x%08hX  fds: 0x%04hX  fdp: 0x%08hX  fop: 0x%04hX  mxcsr: 0x%08hX",
 				cpu->cpu_ctx.regs.fcs,
 				cpu->cpu_ctx.regs.fip,
 				cpu->cpu_ctx.regs.fds,
 				cpu->cpu_ctx.regs.fdp,
-				cpu->cpu_ctx.regs.fop
+				cpu->cpu_ctx.regs.fop,
+				cpu->cpu_ctx.regs.mxcsr
+			);
+			ImGui::Text("xmm0.h: 0x%016" PRIX64 "  xmm0.l: 0x%016" PRIX64 "  xmm1.h: 0x%016" PRIX64 "  xmm1.l: 0x%016" PRIX64 "  xmm2.h: 0x%016" PRIX64 "  xmm2.l: 0x%016" PRIX64 "  xmm3.h: 0x%016" PRIX64 "  xmm3.l: 0x%016" PRIX64,
+				cpu->cpu_ctx.regs.xmm[0].high,
+				cpu->cpu_ctx.regs.xmm[0].low,
+				cpu->cpu_ctx.regs.xmm[1].high,
+				cpu->cpu_ctx.regs.xmm[1].low,
+				cpu->cpu_ctx.regs.xmm[2].high,
+				cpu->cpu_ctx.regs.xmm[2].low,
+				cpu->cpu_ctx.regs.xmm[3].high,
+				cpu->cpu_ctx.regs.xmm[3].low
+			);
+			ImGui::Text("xmm4.h: 0x%016" PRIX64 "  xmm4.l: 0x%016" PRIX64 "  xmm5.h: 0x%016" PRIX64 "  xmm5.l: 0x%016" PRIX64 "  xmm6.h: 0x%016" PRIX64 "  xmm6.l: 0x%016" PRIX64 "  xmm7.h: 0x%016" PRIX64 "  xmm7.l: 0x%016" PRIX64,
+				cpu->cpu_ctx.regs.xmm[4].high,
+				cpu->cpu_ctx.regs.xmm[4].low,
+				cpu->cpu_ctx.regs.xmm[5].high,
+				cpu->cpu_ctx.regs.xmm[5].low,
+				cpu->cpu_ctx.regs.xmm[6].high,
+				cpu->cpu_ctx.regs.xmm[6].low,
+				cpu->cpu_ctx.regs.xmm[7].high,
+				cpu->cpu_ctx.regs.xmm[7].low
 			);
 		}
 		else {
 			const char *text = "Not available while debuggee is running";
 			ImGui::SetCursorPos(ImVec2(ImGui::GetWindowWidth() / 2 - (ImGui::CalcTextSize(text).x / 2), ImGui::GetWindowHeight() / 2 - (ImGui::CalcTextSize(text).y / 2)));
-			ImGui::Text(text);
+			ImGui::Text("%s", text);
 		}
 		ImGui::EndChild();
 	}

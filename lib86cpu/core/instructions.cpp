@@ -822,11 +822,16 @@ update_crN_helper(cpu_ctx_t *cpu_ctx, uint32_t new_cr, uint8_t idx)
 			tlb_flush(cpu_ctx->cpu);
 		}
 
+		cpu_ctx->hflags = ((new_cr & CR4_OSFXSR_MASK) | (cpu_ctx->hflags & ~HFLG_CR4_OSFXSR));
 		cpu_ctx->regs.cr4 = new_cr;
 	}
 	break;
 
 	case 2:
+		// cr2 is handled by the jit
+		assert(0);
+		[[fallthrough]];
+
 	default:
 		LIB86CPU_ABORT();
 	}
@@ -930,6 +935,18 @@ msr_read_helper(cpu_ctx_t *cpu_ctx)
 		val = (MSR_MTRRcap_VCNT | MSR_MTRRcap_FIX | MSR_MTRRcap_WC);
 		break;
 
+	case IA32_SYSENTER_CS:
+		val = cpu_ctx->cpu->msr.sys_cs & 0xFFFFFFFF;
+		break;
+
+	case IA32_SYSENTER_ESP:
+		val = cpu_ctx->cpu->msr.sys_esp;
+		break;
+
+	case IA32_SYSENTER_EIP:
+		val = cpu_ctx->cpu->msr.sys_eip;
+		break;
+
 	case IA32_MTRR_PHYSBASE(0):
 	case IA32_MTRR_PHYSBASE(1):
 	case IA32_MTRR_PHYSBASE(2):
@@ -972,6 +989,10 @@ msr_read_helper(cpu_ctx_t *cpu_ctx)
 		val = cpu_ctx->cpu->msr.mtrr.phys_fixed[cpu_ctx->regs.ecx - IA32_MTRR_FIX4K_C0000 + 3];
 		break;
 
+	case IA32_PAT:
+		val = cpu_ctx->cpu->msr.pat;
+		break;
+
 	case IA32_MTRR_DEF_TYPE:
 		val = cpu_ctx->cpu->msr.mtrr.def_type;
 		break;
@@ -1012,6 +1033,18 @@ msr_write_helper(cpu_ctx_t *cpu_ctx)
 
 	case IA32_MTRRCAP:
 		return 1;
+
+	case IA32_SYSENTER_CS:
+		cpu_ctx->cpu->msr.sys_cs = (val & 0xFFFFFFFF);
+		break;
+
+	case IA32_SYSENTER_ESP:
+		cpu_ctx->cpu->msr.sys_esp = val;
+		break;
+
+	case IA32_SYSENTER_EIP:
+		cpu_ctx->cpu->msr.sys_eip = val;
+		break;
 
 	case IA32_MTRR_PHYSBASE(0):
 	case IA32_MTRR_PHYSBASE(1):
@@ -1059,6 +1092,19 @@ msr_write_helper(cpu_ctx_t *cpu_ctx)
 	case IA32_MTRR_FIX4K_F0000:
 	case IA32_MTRR_FIX4K_F8000:
 		cpu_ctx->cpu->msr.mtrr.phys_fixed[cpu_ctx->regs.ecx - IA32_MTRR_FIX4K_C0000 + 3] = val;
+		break;
+
+	case IA32_PAT:
+		if (val & MSR_PAT_RES) {
+			return 1;
+		}
+		for (unsigned i = 0; i < 7; ++i) {
+			uint64_t pat_type = (val >> (i * 8)) & 7;
+			if ((pat_type == PAT_TYPE_RES2) || (pat_type == PAT_TYPE_RES3)) {
+				return 1;
+			}
+		}
+		cpu_ctx->cpu->msr.pat = val;
 		break;
 
 	case IA32_MTRR_DEF_TYPE:
@@ -1236,7 +1282,7 @@ hlt_helper(cpu_ctx_t *cpu_ctx)
 		throw lc86_exp_abort("Received abort signal, terminating the emulation", lc86_status::success);
 	}
 
-	if (((int_flg & CPU_HW_INT) | (cpu_ctx->regs.eflags & IF_MASK)) == (CPU_HW_INT | IF_MASK)) {
+	if (((int_flg & CPU_HW_INT) | (cpu_ctx->regs.eflags & IF_MASK) | (cpu_ctx->hflags & HFLG_INHIBIT_INT)) == (CPU_HW_INT | IF_MASK)) {
 		cpu_ctx->exp_info.exp_data.fault_addr = 0;
 		cpu_ctx->exp_info.exp_data.code = 0;
 		cpu_ctx->exp_info.exp_data.idx = cpu_ctx->cpu->get_int_vec();

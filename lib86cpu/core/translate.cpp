@@ -5,7 +5,7 @@
  */
 
 #include "internal.h"
-#include "memory.h"
+#include "memory_management.h"
 #include "main_wnd.h"
 #include "debugger.h"
 #include "helpers.h"
@@ -39,6 +39,7 @@ cpu_reset(cpu_t *cpu)
 	cpu->cpu_ctx.regs.tr_hidden.limit = 0xFFFF;
 	cpu->cpu_ctx.regs.ldtr_hidden.flags = ((1 << 15) | (2 << 8)); // present, ldt
 	cpu->cpu_ctx.regs.tr_hidden.flags = ((1 << 15) | (11 << 8)); // present, 32bit tss busy
+	cpu->cpu_ctx.regs.mxcsr = 0x1F80;
 	cpu->cpu_ctx.lazy_eflags.result = 0x100; // make zf=0
 	cpu->a20_mask = 0xFFFFFFFF; // gate closed
 	cpu->cpu_ctx.exp_info.old_exp = EXP_INVALID;
@@ -329,15 +330,9 @@ translated_code_t *cpu_raise_exception(cpu_ctx_t *cpu_ctx)
 		cpu_ctx->regs.cs_hidden.flags = seg_flags;
 		cpu_ctx->hflags = (((seg_flags & SEG_HIDDEN_DB) >> 20) | dpl) | (cpu_ctx->hflags & ~(HFLG_CS32 | HFLG_CPL));
 		cpu_ctx->regs.eip = new_eip;
-		// always clear HFLG_DBG_TRAP
-		cpu_ctx->hflags &= ~HFLG_DBG_TRAP;
 		if (idx == EXP_PF) {
 			cpu_ctx->regs.cr2 = fault_addr;
 		}
-		if (idx == EXP_DB) {
-			cpu_ctx->regs.dr[7] &= ~DR7_GD_MASK;
-		}
-		cpu_ctx->exp_info.old_exp = EXP_INVALID;
 	}
 	else {
 		// real mode
@@ -364,12 +359,13 @@ translated_code_t *cpu_raise_exception(cpu_ctx_t *cpu_ctx)
 		cpu_ctx->regs.cs = vec_entry >> 16;
 		cpu_ctx->regs.cs_hidden.base = cpu_ctx->regs.cs << 4;
 		cpu_ctx->regs.eip = vec_entry & 0xFFFF;
-		// always clear HFLG_DBG_TRAP
-		cpu_ctx->hflags &= ~HFLG_DBG_TRAP;
-		if (idx == EXP_DB) {
-			cpu_ctx->regs.dr[7] &= ~DR7_GD_MASK;
-		}
-		cpu_ctx->exp_info.old_exp = EXP_INVALID;
+	}
+
+	cpu_ctx->hflags &= ~HFLG_DBG_TRAP; // always clear HFLG_DBG_TRAP
+	cpu_ctx->exp_info.old_exp = EXP_INVALID;
+	cpu_ctx->hflags &= ~HFLG_INHIBIT_INT; // an exception clears the interrupt inhibition state
+	if (idx == EXP_DB) {
+		cpu_ctx->regs.dr[7] &= ~DR7_GD_MASK;
 	}
 
 	return nullptr;
@@ -381,11 +377,18 @@ get_pc(cpu_ctx_t *cpu_ctx)
 	return cpu_ctx->regs.cs_hidden.base + cpu_ctx->regs.eip;
 }
 
+// dummy tc only used for comparisons in the ibtc. Using the invalid hflag makes sure that comparisons with it always fail, and avoids the need to check
+// if an entry in the ibtc exists (e.g. cheking for nullptr)
+static translated_code_t dummy_tc(HFLG_INVALID);
+
 translated_code_t::translated_code_t() noexcept
 {
 	size = 0;
 	flags = 0;
 	ptr_code = nullptr;
+	for (auto &entry : ibtc) {
+		entry = &dummy_tc;
+	}
 }
 
 static inline uint32_t
@@ -398,7 +401,6 @@ template<bool remove_hook>
 void tc_invalidate(cpu_ctx_t *cpu_ctx, addr_t phys_addr, [[maybe_unused]] uint8_t size, [[maybe_unused]] uint32_t eip)
 {
 	bool halt_tc = false;
-	bool is_code;
 
 	if constexpr (!remove_hook) {
 		if (cpu_ctx->cpu->cpu_flags & CPU_ALLOW_CODE_WRITE) {
@@ -427,15 +429,50 @@ void tc_invalidate(cpu_ctx_t *cpu_ctx, addr_t phys_addr, [[maybe_unused]] uint8_
 
 			if (remove_tc) {
 				auto it_list = tc_in_page->linked_tc.begin();
-				// now unlink all other tc's which jump to this tc
+				// now unlink all other tc's that jump to this tc (aka the predecessors)
 				while (it_list != tc_in_page->linked_tc.end()) {
-					if ((*it_list)->jmp_offset[0] == tc_in_page->ptr_code) {
-						(*it_list)->jmp_offset[0] = (*it_list)->jmp_offset[2];
+					uint32_t tc_link_type = (*it_list)->flags & TC_FLG_LINK_MASK;
+					if ((tc_link_type == TC_FLG_DIRECT) || (tc_link_type == TC_FLG_DST_COND) || (tc_link_type == TC_FLG_DST_ONLY)) {
+						if ((*it_list)->jmp_offset[0] == tc_in_page->ptr_code) {
+							(*it_list)->jmp_offset[0] = (*it_list)->jmp_offset[2];
+						}
+						if ((*it_list)->jmp_offset[1] == tc_in_page->ptr_code) {
+							(*it_list)->jmp_offset[1] = (*it_list)->jmp_offset[2];
+						}
 					}
-					if ((*it_list)->jmp_offset[1] == tc_in_page->ptr_code) {
-						(*it_list)->jmp_offset[1] = (*it_list)->jmp_offset[2];
+					else {
+						assert((tc_link_type == TC_FLG_INDIRECT) || (tc_link_type == TC_FLG_RET));
+						for (auto &entry : (*it_list)->ibtc) {
+							if (entry == tc_in_page) {
+								entry = &dummy_tc;
+							}
+						}
 					}
-					it_list++;
+					++it_list;
+				}
+
+				// now update the linked_tc list of the tc's that this tc is (in)directly jumping to (aka the successors)
+				const auto update_linked_tc_lambda = [tc_in_page](translated_code_t *tc) {
+					if (tc == tc_in_page) {
+						return true;
+					}
+					return false;
+				};
+				if (tc_in_page->jmp_offset[0] != tc_in_page->jmp_offset[2]) {
+					translated_code_t *dst_tc = *reinterpret_cast<translated_code_t **>(reinterpret_cast<uint8_t *>(tc_in_page->jmp_offset[0]) - 14);
+					[[maybe_unused]] const auto erased = std::erase_if(dst_tc->linked_tc, update_linked_tc_lambda);
+					assert(erased);
+				}
+				if (tc_in_page->jmp_offset[1] != tc_in_page->jmp_offset[2]) {
+					translated_code_t *next_tc = *reinterpret_cast<translated_code_t **>(reinterpret_cast<uint8_t *>(tc_in_page->jmp_offset[1]) - 14);
+					[[maybe_unused]] const auto erased = std::erase_if(next_tc->linked_tc, update_linked_tc_lambda);
+					assert(erased);
+				}
+				for (auto &entry : tc_in_page->ibtc) {
+					if (entry->guest_flags != HFLG_INVALID) {
+						[[maybe_unused]] const auto erased = std::erase_if(entry->linked_tc, update_linked_tc_lambda);
+						assert(erased);
+					}
 				}
 
 				// delete the found tc from the code cache
@@ -460,7 +497,7 @@ void tc_invalidate(cpu_ctx_t *cpu_ctx, addr_t phys_addr, [[maybe_unused]] uint8_
 						cpu_ctx->cpu->code_cache[idx].erase(it);
 						break;
 					}
-					it++;
+					++it;
 				}
 
 				// we can't delete the tc in tc_page_map right now because it would invalidate its iterator, which is still needed below
@@ -470,19 +507,15 @@ void tc_invalidate(cpu_ctx_t *cpu_ctx, addr_t phys_addr, [[maybe_unused]] uint8_
 					break;
 				}
 			}
-			it_set++;
+			++it_set;
 		}
 
-		// delete the found tc's from tc_page_map and ibtc
+		// delete the found tc's from tc_page_map
 		for (auto &it : tc_to_delete) {
-			auto it_ibtc = cpu_ctx->cpu->ibtc.find((*it)->virt_pc);
-			if (it_ibtc != cpu_ctx->cpu->ibtc.end()) {
-				cpu_ctx->cpu->ibtc.erase(it_ibtc);
-			}
 			it_map->second.erase(it);
 		}
 
-		// if the tc_page_map for phys_addr is now empty, also clear TLB_CODE and its key in the map
+		// if the tc_page_map for phys_addr is now empty, also clear the corresponding smc bit and its key in the map
 		if (it_map->second.empty()) {
 			cpu_ctx->cpu->smc.reset(phys_addr >> PAGE_SHIFT);
 			cpu_ctx->cpu->tc_page_map.erase(it_map);
@@ -549,7 +582,6 @@ tc_cache_clear(cpu_t *cpu)
 	// Use this when you want to destroy all tc's but without affecting the actual code allocated. E.g: on x86-64, you'll want to keep the .pdata sections
 	// when this is called from a function called from the JITed code, and the current function can potentially throw an exception
 	cpu->tc_page_map.clear();
-	cpu->ibtc.clear();
 	cpu->smc.reset();
 	for (auto &bucket : cpu->code_cache) {
 		bucket.clear();
@@ -625,16 +657,43 @@ tc_link_dst_only(translated_code_t *prev_tc, translated_code_t *ptr_tc)
 	}
 }
 
+static void
+tc_link_indirect(cpu_t *cpu, translated_code_t *prev_tc, translated_code_t *ptr_tc)
+{
+	// dst pc of ptr_tc must be in the same page of prev_tc to avoid possible page faults
+	if ((ptr_tc->virt_pc & ~PAGE_MASK) == (prev_tc->virt_pc & ~PAGE_MASK)) {
+		for (auto &entry : prev_tc->ibtc) {
+			if (entry->guest_flags == HFLG_INVALID) {
+				entry = ptr_tc;
+				ptr_tc->linked_tc.push_front(prev_tc);
+				return;
+			}
+		}
+
+		// if we reach here, it means the ibtc is full. In this case we pick a random entry and replace it
+		std::uniform_int_distribution<uint32_t> dis(0, 2);
+		uint32_t idx = dis(cpu->rng_gen);
+		[[maybe_unused]] const auto erased = std::erase_if(prev_tc->ibtc[idx]->linked_tc, [prev_tc](translated_code_t *tc) {
+			if (tc == prev_tc) {
+				return true;
+			}
+			return false;
+			});
+		assert(erased);
+		prev_tc->ibtc[idx] = ptr_tc;
+		ptr_tc->linked_tc.push_front(prev_tc);
+	}
+}
+
 entry_t
 link_indirect_handler(cpu_ctx_t *cpu_ctx, translated_code_t *tc)
 {
-	const auto it = cpu_ctx->cpu->ibtc.find(get_pc(cpu_ctx));
-
-	if (it != cpu_ctx->cpu->ibtc.end()) {
-		if (it->second->cs_base == cpu_ctx->regs.cs_hidden.base &&
-			it->second->guest_flags == ((cpu_ctx->hflags & HFLG_CONST) | (cpu_ctx->regs.eflags & EFLAGS_CONST)) &&
-			((it->second->virt_pc & ~PAGE_MASK) == (tc->virt_pc & ~PAGE_MASK))) {
-			return it->second->ptr_code;
+	// NOTE: make sure to check guest_flags first, so that if we are comparing against the dummy_tc, we fail at the first comparison
+	for (const auto entry : tc->ibtc) {
+		if (entry->guest_flags == ((cpu_ctx->hflags & HFLG_CONST) | (cpu_ctx->regs.eflags & EFLAGS_CONST)) && // must have matching hidden flags
+			(entry->cs_base == cpu_ctx->regs.cs_hidden.base) && // must have same cs_base to avoid jumping to wrong pc
+			(entry->virt_pc == get_pc(cpu_ctx))) { // must match dst pc we are jumping to
+			return entry->ptr_code;
 		}
 	}
 
@@ -642,31 +701,39 @@ link_indirect_handler(cpu_ctx_t *cpu_ctx, translated_code_t *tc)
 }
 
 static void
-halt_loop(cpu_t *cpu)
+tc_link_prev(cpu_t *cpu, translated_code_t *prev_tc, translated_code_t *ptr_tc)
 {
-	while (true) {
-		uint32_t ret = cpu_timer_helper(&cpu->cpu_ctx);
-		_mm_pause();
+	// see if we can link the previous tc with the current one
+	if (prev_tc != nullptr) {
+		switch (prev_tc->flags & TC_FLG_LINK_MASK)
+		{
+		case 0:
+			break;
 
-		if ((ret == CPU_NO_INT) || (ret == CPU_NON_HW_INT)) {
-			// either nothing changed or it's not a hw int, keep looping in both cases
-			continue;
+		case TC_FLG_DST_ONLY:
+			tc_link_dst_only(prev_tc, ptr_tc);
+			break;
+
+		case TC_FLG_DIRECT:
+		case TC_FLG_DST_COND:
+			tc_link_direct(prev_tc, ptr_tc);
+			break;
+
+		case TC_FLG_RET:
+		case TC_FLG_INDIRECT:
+			tc_link_indirect(cpu, prev_tc, ptr_tc);
+			break;
+
+		default:
+			LIB86CPU_ABORT();
 		}
-
-		if (ret == CPU_HW_INT) {
-			// hw int, exit the loop and clear the halted state
-			cpu->cpu_ctx.is_halted = 0;
-			return;
-		}
-
-		// timeout, exit the loop
-		return;
 	}
 }
 
 static void
-cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
+cpu_translate(cpu_t *cpu)
 {
+	disas_ctx_t *disas_ctx = &cpu->disas_ctx;
 	cpu->translate_next = 1;
 	cpu->virt_pc = disas_ctx->virt_pc;
 
@@ -684,7 +751,7 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 		}
 		catch (host_exp_t type) {
 			// this happens on instr breakpoints (not int3)
-			assert(type == host_exp_t::de_exp);
+			assert(type == host_exp_t::db_exp);
 			cpu->jit->gen_raise_exp_inline(0, 0, EXP_DB, cpu->instr_eip);
 			disas_ctx->flags |= DISAS_FLG_DBG_FAULT;
 			return;
@@ -927,12 +994,24 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 			cpu->jit->enter(&instr);
 			break;
 
+		case ZYDIS_MNEMONIC_FLD:
+			cpu->jit->fld(&instr);
+			break;
+
 		case ZYDIS_MNEMONIC_FNINIT:
 			cpu->jit->fninit(&instr);
 			break;
 
 		case ZYDIS_MNEMONIC_FNSTSW:
 			cpu->jit->fnstsw(&instr);
+			break;
+
+		case ZYDIS_MNEMONIC_FXRSTOR:
+			cpu->jit->fxrstor(&instr);
+			break;
+
+		case ZYDIS_MNEMONIC_FXSAVE:
+			cpu->jit->fxsave(&instr);
 			break;
 
 		case ZYDIS_MNEMONIC_HLT:
@@ -1073,6 +1152,10 @@ cpu_translate(cpu_t *cpu, disas_ctx_t *disas_ctx)
 
 		case ZYDIS_MNEMONIC_MOV:
 			cpu->jit->mov(&instr);
+			break;
+
+		case ZYDIS_MNEMONIC_MOVAPS:
+			cpu->jit->movaps(&instr);
 			break;
 
 		case ZYDIS_MNEMONIC_MOVD:BAD;
@@ -1371,7 +1454,7 @@ cpu_do_int(cpu_ctx_t *cpu_ctx, uint32_t int_flg)
 		return CPU_NON_HW_INT;
 	}
 
-	if (((int_flg & CPU_HW_INT) | (cpu_ctx->regs.eflags & IF_MASK)) == (IF_MASK | CPU_HW_INT)) {
+	if (((int_flg & CPU_HW_INT) | (cpu_ctx->regs.eflags & IF_MASK) | (cpu_ctx->hflags & HFLG_INHIBIT_INT)) == (IF_MASK | CPU_HW_INT)) {
 		cpu_ctx->exp_info.exp_data.fault_addr = 0;
 		cpu_ctx->exp_info.exp_data.code = 0;
 		cpu_ctx->exp_info.exp_data.idx = cpu_ctx->cpu->get_int_vec();
@@ -1412,7 +1495,7 @@ void cpu_main_loop(cpu_t *cpu, T &&lambda)
 			pc = get_code_addr(cpu, virt_pc, cpu->cpu_ctx.regs.eip);
 		}
 		catch (host_exp_t type) {
-			assert((type == host_exp_t::pf_exp) || (type == host_exp_t::de_exp));
+			assert((type == host_exp_t::pf_exp) || (type == host_exp_t::db_exp));
 			cpu_suppress_trampolines<is_tramp>(cpu);
 
 			// this is either a page fault or a debug exception. In both cases, we have to call the exception handler
@@ -1422,7 +1505,7 @@ void cpu_main_loop(cpu_t *cpu, T &&lambda)
 				prev_tc = cpu_raise_exception(&cpu->cpu_ctx);
 			}
 			catch (host_exp_t type) {
-				assert((type == host_exp_t::pf_exp) || (type == host_exp_t::de_exp));
+				assert((type == host_exp_t::pf_exp) || (type == host_exp_t::db_exp));
 
 				// page fault or debug exception while delivering another exception
 				goto retry_exp;
@@ -1446,22 +1529,23 @@ void cpu_main_loop(cpu_t *cpu, T &&lambda)
 			cpu->jit->gen_tc_prologue();
 
 			// prepare the disas ctx
-			disas_ctx_t disas_ctx{};
-			disas_ctx.flags = ((cpu->cpu_ctx.hflags & HFLG_CS32) >> CS32_SHIFT) |
+			cpu->disas_ctx.flags = ((cpu->cpu_ctx.hflags & HFLG_CS32) >> CS32_SHIFT) |
 				((cpu->cpu_ctx.hflags & HFLG_PE_MODE) >> (PE_MODE_SHIFT - 1)) |
+				((cpu->cpu_ctx.hflags & HFLG_INHIBIT_INT) >> 11) |
 				(cpu->cpu_flags & CPU_DISAS_ONE) |
 				((cpu->cpu_flags & CPU_SINGLE_STEP) >> 3) |
 				((cpu->cpu_ctx.regs.eflags & RF_MASK) >> 9) | // if rf is set, we need to clear it after the first instr executed
-				((cpu->cpu_ctx.regs.eflags & TF_MASK) >> 1); // if tf is set, we need to raise a DB exp after every instruction
-			disas_ctx.virt_pc = virt_pc;
-			disas_ctx.pc = pc;
+				((cpu->cpu_ctx.regs.eflags & TF_MASK) >> 1) | // if tf is set, we need to raise a DB exp after every instruction
+				((cpu->cpu_ctx.hflags & HFLG_INHIBIT_INT) >> 7); // if interrupts are inhibited, we need to enable them after the first instr executed
+			cpu->disas_ctx.virt_pc = virt_pc;
+			cpu->disas_ctx.pc = pc;
 
 			if constexpr (is_trap) {
 				// don't take hooks if we are executing a trapped instr. Otherwise, if the trapped instr is also hooked, we will take the hook instead of executing it
-				cpu_translate(cpu, &disas_ctx);
+				cpu_translate(cpu);
 			}
 			else {
-				const auto it = cpu->hook_map.find(disas_ctx.virt_pc);
+				const auto it = cpu->hook_map.find(cpu->disas_ctx.virt_pc);
 				bool take_hook;
 				if constexpr (is_tramp) {
 					take_hook = (it != cpu->hook_map.end()) && !(cpu->cpu_ctx.hflags & HFLG_TRAMP);
@@ -1471,12 +1555,12 @@ void cpu_main_loop(cpu_t *cpu, T &&lambda)
 				}
 
 				if (take_hook) {
-					cpu->instr_eip = disas_ctx.virt_pc - cpu->cpu_ctx.regs.cs_hidden.base;
+					cpu->instr_eip = cpu->disas_ctx.virt_pc - cpu->cpu_ctx.regs.cs_hidden.base;
 					cpu->jit->gen_hook(it->second);
 				}
 				else {
 					// start guest code translation
-					cpu_translate(cpu, &disas_ctx);
+					cpu_translate(cpu);
 				}
 			}
 
@@ -1492,19 +1576,26 @@ void cpu_main_loop(cpu_t *cpu, T &&lambda)
 			ptr_tc = cpu->tc;
 			cpu->tc = nullptr;
 
-			if (disas_ctx.flags & (DISAS_FLG_PAGE_CROSS | DISAS_FLG_ONE_INSTR)) {
+			if (cpu->disas_ctx.flags & (DISAS_FLG_PAGE_CROSS | DISAS_FLG_ONE_INSTR)) {
 				if (cpu->cpu_flags & CPU_FORCE_INSERT) {
 					if ((cpu->num_tc) == CODE_CACHE_MAX_SIZE) {
 						tc_cache_purge(cpu);
 						prev_tc = nullptr;
 					}
 					tc_cache_insert(cpu, pc, std::move(tc));
+
+					// if the tc is forcefully inserted, then we can still link it
+					tc_link_prev(cpu, prev_tc, ptr_tc);
 				}
 
+				uint32_t cpu_flags = cpu->cpu_flags;
 				cpu_suppress_trampolines<is_tramp>(cpu);
 				cpu->cpu_flags &= ~(CPU_DISAS_ONE | CPU_ALLOW_CODE_WRITE | CPU_FORCE_INSERT);
-				tc_run_code(&cpu->cpu_ctx, ptr_tc);
-				prev_tc = nullptr;
+				prev_tc = tc_run_code(&cpu->cpu_ctx, ptr_tc);
+				if (!(cpu_flags & CPU_FORCE_INSERT)) {
+					cpu->jit->free_code_block(reinterpret_cast<void *>(ptr_tc->jmp_offset[2]));
+					prev_tc = nullptr;
+				}
 				continue;
 			}
 			else {
@@ -1519,29 +1610,7 @@ void cpu_main_loop(cpu_t *cpu, T &&lambda)
 		cpu_suppress_trampolines<is_tramp>(cpu);
 
 		// see if we can link the previous tc with the current one
-		if (prev_tc != nullptr) {
-			switch (prev_tc->flags & TC_FLG_LINK_MASK)
-			{
-			case 0:
-				break;
-
-			case TC_FLG_DST_ONLY:
-				tc_link_dst_only(prev_tc, ptr_tc);
-				break;
-
-			case TC_FLG_DIRECT:
-				tc_link_direct(prev_tc, ptr_tc);
-				break;
-
-			case TC_FLG_RET:
-			case TC_FLG_INDIRECT:
-				cpu->ibtc.insert_or_assign(virt_pc, ptr_tc);
-				break;
-
-			default:
-				LIB86CPU_ABORT();
-			}
-		}
+		tc_link_prev(cpu, prev_tc, ptr_tc);
 
 		prev_tc = tc_run_code(&cpu->cpu_ctx, ptr_tc);
 	}
@@ -1565,7 +1634,7 @@ tc_run_code(cpu_ctx_t *cpu_ctx, translated_code_t *tc)
 				return cpu_raise_exception(cpu_ctx);
 			}
 			catch (host_exp_t type) {
-				assert((type == host_exp_t::pf_exp) || (type == host_exp_t::de_exp));
+				assert((type == host_exp_t::pf_exp) || (type == host_exp_t::db_exp));
 
 				// page fault or debug exception while delivering another exception
 				goto retry_exp;
@@ -1573,7 +1642,7 @@ tc_run_code(cpu_ctx_t *cpu_ctx, translated_code_t *tc)
 		}
 		break;
 
-		case host_exp_t::de_exp: {
+		case host_exp_t::db_exp: {
 			// debug exception trap (mem/io r/w watch) while excecuting the translated code.
 			// We set CPU_DBG_TRAP, so that we can execute the trapped instruction without triggering again a de exp,
 			// and then jump to the debug handler. Note thate eip points to the trapped instr, so we can execute it.
@@ -1595,6 +1664,8 @@ tc_run_code(cpu_ctx_t *cpu_ctx, translated_code_t *tc)
 			LIB86CPU_ABORT_msg("Unknown host exception in %s", __func__);
 		}
 	}
+
+	LIB86CPU_ABORT();
 }
 
 template<bool run_forever>

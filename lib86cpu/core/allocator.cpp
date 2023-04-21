@@ -7,47 +7,14 @@
 #include "lib86cpu_priv.h"
 #include "internal.h"
 #include "allocator.h"
-#include "Windows.h"
+#include "os_mem.h"
+#include "os_exceptions.h"
 
-
-DWORD
-get_mem_flags(unsigned flags)
-{
-	switch (flags)
-	{
-	case MEM_READ:
-		return PAGE_READONLY;
-
-	case MEM_WRITE:
-		return PAGE_READWRITE;
-
-	case MEM_READ | MEM_WRITE:
-		return PAGE_READWRITE;
-
-	case MEM_READ | MEM_EXEC:
-		return PAGE_EXECUTE_READ;
-
-	case MEM_READ | MEM_WRITE | MEM_EXEC:
-		return PAGE_EXECUTE_READWRITE;
-
-	case MEM_EXEC:
-		return PAGE_EXECUTE;
-
-	default:
-		LIB86CPU_ABORT();
-	}
-
-	return PAGE_NOACCESS;
-}
 
 mem_manager::block_header_t *
 mem_manager::create_pool()
 {
-	block_header_t *start = static_cast<block_header_t *>(VirtualAlloc(NULL, POOL_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-	if (start == NULL) {
-		return nullptr;
-	}
-
+	block_header_t *start = static_cast<block_header_t *>(os_alloc(POOL_SIZE));
 	block_header_t *addr = start;
 	for (unsigned i = 0; i < BLOCKS_PER_POOL - 1; i++) {
 		addr->next = reinterpret_cast<block_header_t *>(reinterpret_cast<uint8_t *>(addr) + BLOCK_SIZE);
@@ -64,9 +31,6 @@ mem_manager::alloc()
 {
 	if (head == nullptr) {
 		head = create_pool();
-		if (head == nullptr) {
-			return nullptr;
-		}
 	}
 
 	block_header_t *addr = head;
@@ -78,9 +42,7 @@ void
 mem_manager::free(void *ptr)
 {
 	// this is necessary because we mark the code section memory as read-only after the code is written to it
-	DWORD dummy;
-	[[maybe_unused]] DWORD ret = VirtualProtect(ptr, BLOCK_SIZE, PAGE_READWRITE, &dummy);
-	assert(ret);
+	os_protect(ptr, BLOCK_SIZE, get_mem_flags(MEM_READ | MEM_WRITE));
 	static_cast<block_header_t *>(ptr)->next = head;
 	head = static_cast<block_header_t *>(ptr);
 }
@@ -88,22 +50,32 @@ mem_manager::free(void *ptr)
 void
 mem_manager::destroy_all_blocks()
 {
-#if defined(_WIN64)
+#if defined(_WIN64) || defined(__linux__)
 	for (const auto &eh_pair : eh_frames) {
-		RtlDeleteFunctionTable(static_cast<PRUNTIME_FUNCTION>(eh_pair.second));
+		os_delete_exp_info(eh_pair.second);
 	}
 
 	eh_frames.clear();
 #endif
 
+#if defined(_WIN64)
 	for (auto &addr : blocks) {
-		VirtualFree(addr, 0, MEM_RELEASE);
+		os_free(addr);
 	}
 
 	for (auto &block : big_blocks) {
-		VirtualFree(block.first, 0, MEM_RELEASE);
+		os_free(block.first);
 	}
-	
+#elif defined(__linux__)
+	for (auto &addr : blocks) {
+		os_free(addr, POOL_SIZE);
+	}
+
+	for (auto &block : big_blocks) {
+		os_free(block.first, block.second);
+	}
+#endif
+
 	big_blocks.clear();
 	blocks.clear();
 	head = nullptr;
@@ -118,23 +90,13 @@ mem_manager::allocate_sys_mem(size_t num_bytes)
 
 	if (num_bytes > BLOCK_SIZE) {
 		size_t block_size = (num_bytes + PAGE_MASK) & ~PAGE_MASK;
-
-		void *addr = VirtualAlloc(NULL, block_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-		if (addr == NULL) {
-			return mem_block();
-		}
-
+		void *addr = os_alloc(block_size);
 		mem_block block(addr, block_size);
 		big_blocks.emplace(addr, block_size);
 		return block;
 	}
 
-	void *addr = alloc();
-	if (addr == nullptr) {
-		return mem_block();
-	}
-
-	return mem_block(addr, BLOCK_SIZE);
+	return mem_block(alloc(), BLOCK_SIZE);
 }
 
 void
@@ -147,13 +109,16 @@ mem_manager::protect_sys_mem(const mem_block &block, unsigned flags)
 		return;
 	}
 
-	DWORD dummy, prot = get_mem_flags(flags);
-	[[maybe_unused]] auto ret = VirtualProtect(addr, size, prot, &dummy);
-	assert(ret);
+	os_protect(addr, size, get_mem_flags(flags));
 
 	if (flags & MEM_EXEC) {
-		ret = FlushInstructionCache(GetCurrentProcess(), addr, size);
-		assert(ret);
+#if defined(_WIN64)
+		os_flush_instr_cache(addr, size);
+#elif defined(__linux__)
+		void *start = addr;
+		void *end = static_cast<char *>(addr) + size;
+		os_flush_instr_cache(start, end);
+#endif
 	}
 }
 
@@ -165,16 +130,19 @@ mem_manager::release_sys_mem(void *addr)
 	}
 
 #if defined(_WIN64)
-	if (auto it = eh_frames.find(addr); it != eh_frames.end()) {
-		[[maybe_unused]] auto ret = RtlDeleteFunctionTable(static_cast<PRUNTIME_FUNCTION>(it->second));
-		assert(ret);
-		eh_frames.erase(addr);
+	void *main_addr = reinterpret_cast<uint8_t *>(addr) + 16;
+	if (auto it = eh_frames.find(main_addr); it != eh_frames.end()) {
+		os_delete_exp_info(it->second);
+		eh_frames.erase(main_addr);
 	}
 #endif
 	
 	if (auto it = big_blocks.find(addr); it != big_blocks.end()) {
-		[[maybe_unused]] auto ret = VirtualFree(it->first, 0, MEM_RELEASE);
-		assert(ret);
+#if defined(_WIN64)
+		os_free(it->first);
+#elif defined(__linux__)
+		os_free(it->first, it->second);
+#endif
 		big_blocks.erase(addr);
 		return;
 	}

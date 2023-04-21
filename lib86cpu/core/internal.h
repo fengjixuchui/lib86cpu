@@ -19,9 +19,12 @@ void tc_cache_clear(cpu_t *cpu);
 void tc_cache_purge(cpu_t *cpu);
 addr_t get_pc(cpu_ctx_t *cpu_ctx);
 template<bool is_intn = false, bool is_hw_int = false>
-translated_code_t *cpu_raise_exception(cpu_ctx_t *cpu_ctx);
-uint32_t cpu_do_int(cpu_ctx_t *cpu_ctx, uint32_t int_flg);
+translated_code_t * JIT_API cpu_raise_exception(cpu_ctx_t *cpu_ctx);
+uint32_t JIT_API cpu_do_int(cpu_ctx_t *cpu_ctx, uint32_t int_flg);
 void fpu_init(cpu_t *cpu);
+void JIT_API fpu_update_tag(cpu_ctx_t *cpu_ctx, uint32_t idx);
+void halt_loop(cpu_t *cpu);
+void JIT_API tlb_invalidate_(cpu_ctx_t *cpu_ctx, addr_t addr);
 
 
 // cpu hidden flags (assumed to be constant during exec of a tc, together with a flag subset of eflags)
@@ -32,8 +35,9 @@ void fpu_init(cpu_t *cpu);
 // HFLG_CR0_EM: em flag of cr0
 // HFLG_TRAMP: used to select the trampoline tc instead of the hook tc
 // HFLG_DBG_TRAP: used to suppress data/io watchpoints (not recorded in the tc flags)
-// HFLG_TIMEOUT: timeout check was emitted
+// HFLG_CR4_OSFXSR: osfxsr flag of cr4
 // HFLG_CR0_TS: ts flag of cr0
+// HFLG_TIMEOUT: timeout check was emitted
 #define CPL_SHIFT           0
 #define CS32_SHIFT          2
 #define SS32_SHIFT          3
@@ -41,8 +45,11 @@ void fpu_init(cpu_t *cpu);
 #define CR0_EM_SHIFT        5
 #define TRAMP_SHIFT         6
 #define DBG_TRAP_SHIFT      7
-#define TIMEOUT_SHIFT       9
+#define CR4_OSFXSR_SHIFT    9
 #define CR0_TS_SHIFT        10
+#define TIMEOUT_SHIFT       11
+#define INHIBIT_INT_SHIFT   14
+#define HFLG_INVALID        (1 << 31) // this should use a bit position that doesn't overlap with either HFLG_CONST or EFLAGS_CONST
 #define HFLG_CPL            (3 << CPL_SHIFT)
 #define HFLG_CS32           (1 << CS32_SHIFT)
 #define HFLG_SS32           (1 << SS32_SHIFT)
@@ -51,8 +58,10 @@ void fpu_init(cpu_t *cpu);
 #define HFLG_TRAMP          (1 << TRAMP_SHIFT)
 #define HFLG_DBG_TRAP       (1 << DBG_TRAP_SHIFT)
 #define HFLG_TIMEOUT        (1 << TIMEOUT_SHIFT)
+#define HFLG_INHIBIT_INT    (1 << INHIBIT_INT_SHIFT)
 #define HFLG_CR0_TS         (1 << CR0_TS_SHIFT)
-#define HFLG_CONST          (HFLG_CPL | HFLG_CS32 | HFLG_SS32 | HFLG_PE_MODE | HFLG_CR0_EM | HFLG_TRAMP | HFLG_TIMEOUT | HFLG_CR0_TS)
+#define HFLG_CR4_OSFXSR     (1 << CR4_OSFXSR_SHIFT)
+#define HFLG_CONST          (HFLG_CPL | HFLG_CS32 | HFLG_SS32 | HFLG_PE_MODE | HFLG_CR0_EM | HFLG_TRAMP | HFLG_TIMEOUT | HFLG_CR0_TS | HFLG_CR4_OSFXSR)
 
 // cpu interrupt flags
 #define CPU_NO_INT      0
@@ -70,7 +79,9 @@ void fpu_init(cpu_t *cpu);
 
 // disassembly context flags
 #define DISAS_FLG_CS32         (1 << 0)
+#define DISAS_FLG_PE_MODE      (1 << 1)
 #define DISAS_FLG_PAGE_CROSS   (1 << 2)
+#define DISAS_FLG_INHIBIT_INT  (1 << 3)
 #define DISAS_FLG_FETCH_FAULT  DISAS_FLG_PAGE_CROSS
 #define DISAS_FLG_DBG_FAULT    DISAS_FLG_PAGE_CROSS
 #define DISAS_FLG_ONE_INSTR    CPU_DISAS_ONE
@@ -85,7 +96,8 @@ void fpu_init(cpu_t *cpu);
 #define TC_FLG_JMP_TAKEN       (3 << 4)
 #define TC_FLG_RET             (1 << 6)
 #define TC_FLG_DST_ONLY        (1 << 7)  // jump(dest_pc)
-#define TC_FLG_LINK_MASK  (TC_FLG_INDIRECT | TC_FLG_DIRECT | TC_FLG_RET | TC_FLG_DST_ONLY)
+#define TC_FLG_DST_COND        (1 << 8)  // jump(dest_pc) based on binary condition
+#define TC_FLG_LINK_MASK  (TC_FLG_INDIRECT | TC_FLG_DIRECT | TC_FLG_RET | TC_FLG_DST_ONLY | TC_FLG_DST_COND)
 
 // segment descriptor flags
 #define SEG_DESC_TY   (15ULL << 40) // type
@@ -151,6 +163,14 @@ void fpu_init(cpu_t *cpu);
 #define R5_idx      38
 #define R6_idx      39
 #define R7_idx      40
+#define XMM0_idx    41
+#define XMM1_idx    42
+#define XMM2_idx    43
+#define XMM3_idx    44
+#define XMM4_idx    45
+#define XMM5_idx    46
+#define XMM6_idx    47
+#define XMM7_idx    48
 
 #define SEG_offset  ES_idx
 #define CR_offset   CR0_idx
@@ -263,6 +283,7 @@ CR0_TS_MASK | CR0_EM_MASK | CR0_MP_MASK | CR0_PE_MASK)
 #define CR4_PSE_MASK    (1 << 4)
 #define CR4_PAE_MASK    (1 << 5)
 #define CR4_PGE_MASK    (1 << 7)
+#define CR4_OSFXSR_MASK (1 << 9)
 #define CR4_UMIP_MASK   (1 << 11)
 #define CR4_RES_MASK    (0x1FFFFF << 11) // cr4 reserved bits
 
@@ -292,6 +313,9 @@ CR0_TS_MASK | CR0_EM_MASK | CR0_MP_MASK | CR0_PE_MASK)
 #define IA32_BIOS_UPDT_TRIG        0x79
 #define IA32_BIOS_SIGN_ID          0x8B
 #define IA32_MTRRCAP               0xFE
+#define IA32_SYSENTER_CS           0x174
+#define IA32_SYSENTER_ESP          0x175
+#define IA32_SYSENTER_EIP          0x176
 #define IA32_MTRR_PHYSBASE_base    0x200
 #define IA32_MTRR_PHYSMASK_base    0x201
 #define IA32_MTRR_FIX64K_00000     0x250
@@ -305,6 +329,7 @@ CR0_TS_MASK | CR0_EM_MASK | CR0_MP_MASK | CR0_PE_MASK)
 #define IA32_MTRR_FIX4K_E8000      0x26D
 #define IA32_MTRR_FIX4K_F0000      0x26E
 #define IA32_MTRR_FIX4K_F8000      0x26F
+#define IA32_PAT                   0x277
 #define IA32_MTRR_DEF_TYPE         0x2FF
 #define IA32_MTRR_PHYSBASE(n)      (IA32_MTRR_PHYSBASE_base + (n * 2))
 #define IA32_MTRR_PHYSMASK(n)      (IA32_MTRR_PHYSMASK_base + (n * 2))
@@ -319,18 +344,23 @@ CR0_TS_MASK | CR0_EM_MASK | CR0_MP_MASK | CR0_PE_MASK)
 #define MSR_MTRR_PHYSBASE_RES      0xFFFFFFF000000F00
 #define MSR_MTRR_PHYSMASK_RES      0xFFFFFFF0000007FF
 #define MSR_MTRR_DEF_TYPE_RES      0xFFFFFFFFFFFFF300
+#define MSR_PAT_RES                0xF8F8F8F8F8F8F8F8
+
+// pat macros
+#define PAT_TYPE_UC    0 // Uncacheable
+#define PAT_TYPE_WC    1 // Write Combining
+#define PAT_TYPE_RES2  2 // Reserved
+#define PAT_TYPE_RES3  3 // Reserved
+#define PAT_TYPE_WT    4 // Write Through
+#define PAT_TYPE_WP    5 // Write Protected
+#define PAT_TYPE_WB    6 // Write Back
+#define PAT_TYPE_UC2   7 // Uncached
 
 // fpu tag macros
 #define FPU_TAG_VALID   0
 #define FPU_TAG_ZERO    1
 #define FPU_TAG_SPECIAL 2  // invalid (NaN, unsupported), infinity, or denormal
 #define FPU_TAG_EMPTY   3
-
-// fpu register macros
-#define FPU_FES_SHIFT    7
-#define FPU_FTSS_SHIFT   11
-#define FPU_FES_MASK     (1 << FPU_FES_SHIFT)
-#define FPU_FTSS_MASK    (7 << FPU_FTSS_SHIFT)
 
 // fpu exception macros
 #define FPU_EXP_INVALID    (1 << 0)
@@ -340,6 +370,35 @@ CR0_TS_MASK | CR0_EM_MASK | CR0_MP_MASK | CR0_PE_MASK)
 #define FPU_EXP_UNDERFLOW  (1 << 4)
 #define FPU_EXP_PRECISION  (1 << 5)
 #define FPU_EXP_ALL        (FPU_EXP_INVALID | FPU_EXP_DENORMAL | FPU_EXP_DIVBYZERO | FPU_EXP_OVERFLOW | FPU_EXP_UNDERFLOW | FPU_EXP_PRECISION)
+
+// fpu fstatus flags and shifts
+#define FPU_FLG_IE     FPU_EXP_INVALID
+#define FPU_FLG_DE     FPU_EXP_DENORMAL
+#define FPU_FLG_ZE     FPU_EXP_DIVBYZERO
+#define FPU_FLG_OE     FPU_EXP_OVERFLOW
+#define FPU_FLG_UE     FPU_EXP_UNDERFLOW
+#define FPU_FLG_PE     FPU_EXP_PRECISION
+#define FPU_FLG_SF     (1 << 6)
+#define FPU_FLG_ES     (1 << 7)
+#define FPU_FLG_TOP    (7 << 11)
+#define FPU_FLG_BSY    (1 << 15)
+#define FPU_ES_SHIFT   7
+#define FPU_C0_SHIFT   8
+#define FPU_C1_SHIFT   9
+#define FPU_C2_SHIFT   10
+#define FPU_TOP_SHIFT  11
+#define FPU_C3_SHIFT   14
+
+
+// fpu indefinite values
+#define FPU_INTEGER_INDEFINITE8      (1 << 7)
+#define FPU_INTEGER_INDEFINITE16     (1 << 15)
+#define FPU_INTEGER_INDEFINITE32     (1 << 31)
+#define FPU_INTEGER_INDEFINITE64     (1ULL << 63)
+#define FPU_QNAN_FLOAT_INDEFINITE64  0xC000000000000000 // mantissa part
+#define FPU_QNAN_FLOAT_INDEFINITE16  0xFFFF             // exponent and sign parts
+#define FPU_BCD_INDEFINITE64         0xC000000000000000 // mantissa part
+#define FPU_BCD_INDEFINITE16         0xFFFF             // exponent and sign parts
 
 // fpu precision macros
 #define FPU_SINGLE_PRECISION      0
@@ -351,6 +410,8 @@ CR0_TS_MASK | CR0_EM_MASK | CR0_MP_MASK | CR0_PE_MASK)
 #define FPU_ROUND_DOWN  1
 #define FPU_ROUND_UP    2
 #define FPU_ROUND_ZERO  3
+
+#define MXCSR_MASK 0x0000FFBF
 
 #define X86_MAX_INSTR_LENGTH 15
 #define INTEL_MICROCODE_ID   (1ULL << 32)

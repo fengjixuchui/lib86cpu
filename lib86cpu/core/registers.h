@@ -6,6 +6,9 @@
 
 #pragma once
 
+#include "config.h"
+#include "platform.h"
+
 #define DEFINE_REG32(_reg) \
 		uint32_t		_reg
 
@@ -20,11 +23,28 @@
 			uint32_t flags; \
 		} _reg ## _hidden;
 
-#define DEFINE_FP80(_reg) \
-	PACKED(struct { \
-		uint64_t low; \
-		uint16_t high; \
-	} _reg;)
+PACKED(struct alignas(16) uint128_t {
+	uint64_t low;
+	uint64_t high;
+	uint128_t();
+	uint128_t(uint64_t val);
+	uint128_t &operator|=(const uint128_t &rhs);
+	uint128_t operator>>(int shift);
+	uint128_t operator<<(int shift);
+	explicit operator uint8_t ();
+});
+
+PACKED(struct uint80_t {
+	uint64_t low;
+	uint16_t high;
+	uint80_t();
+	uint80_t(uint64_t val);
+	uint80_t &operator|=(const uint80_t &rhs);
+	uint80_t operator>>(int shift);
+	uint80_t operator<<(int shift);
+	explicit operator uint8_t ();
+	operator uint128_t ();
+});
 
 struct regs_t {
 	/* General registers */
@@ -67,14 +87,7 @@ struct regs_t {
 	DEFINE_SEG_REG(tr);
 
 	/* Fpu registers */
-	DEFINE_FP80(r0);
-	DEFINE_FP80(r1);
-	DEFINE_FP80(r2);
-	DEFINE_FP80(r3);
-	DEFINE_FP80(r4);
-	DEFINE_FP80(r5);
-	DEFINE_FP80(r6);
-	DEFINE_FP80(r7);
+	uint80_t fr[8];
 	DEFINE_REG16(fctrl);
 	DEFINE_REG16(fstatus);
 	uint8_t ftags[8]; // two tag bits of tag reg splitted in their own reg
@@ -83,6 +96,10 @@ struct regs_t {
 	DEFINE_REG16(fds);
 	DEFINE_REG32(fdp);
 	DEFINE_REG16(fop);
+
+	/* Sse registers */
+	uint128_t xmm[8];
+	DEFINE_REG32(mxcsr);
 };
 
 struct msr_t {
@@ -95,4 +112,12 @@ struct msr_t {
 		uint64_t def_type;
 	} mtrr;
 	uint64_t bios_sign_id;
+	uint64_t pat;
+	uint64_t sys_cs;
+	uint64_t sys_esp;
+	uint64_t sys_eip;
 };
+
+static_assert(sizeof(uint80_t) == 10);
+static_assert(sizeof(uint128_t) == 16);
+static_assert(alignof(decltype(regs_t::xmm)) == 16);

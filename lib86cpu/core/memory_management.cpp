@@ -5,7 +5,7 @@
  */
 
 #include "internal.h"
-#include "memory.h"
+#include "memory_management.h"
 #include <assert.h>
 
 
@@ -156,6 +156,12 @@ void tlb_flush(cpu_t *cpu)
 			}
 		}
 	}
+}
+
+void
+tlb_invalidate_(cpu_ctx_t *cpu_ctx, addr_t addr)
+{
+	tlb_invalidate(cpu_ctx->cpu, addr);
 }
 
 int8_t
@@ -436,14 +442,10 @@ addr_t get_code_addr(cpu_t *cpu, addr_t addr, uint32_t eip, disas_ctx_t *disas_c
 	return mmu_translate_addr<true, true, false>(cpu, addr, set_smc ? MMU_SET_CODE : 0, eip, disas_ctx);
 }
 
-size_t
-as_ram_dispatch_read(cpu_t *cpu, addr_t addr, size_t size, const memory_region_t<addr_t> *region, uint8_t *buffer)
+uint64_t
+as_ram_dispatch_read(cpu_t *cpu, addr_t addr, uint64_t size, const memory_region_t<addr_t> *region, uint8_t *buffer)
 {
-#if defined(_WIN64)
-	size_t bytes_to_read = std::min((region->end - addr) + 1ULL, size);
-#else
-	size_t bytes_to_read = std::min((region->end - addr) + 1, size);
-#endif
+	uint64_t bytes_to_read = std::min((region->end - addr) + to_u64(1), size);
 
 	switch (region->type)
 	{
@@ -687,14 +689,19 @@ template uint8_t mem_read_helper(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t eip, 
 template uint16_t mem_read_helper(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t eip, uint8_t is_priv);
 template uint32_t mem_read_helper(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t eip, uint8_t is_priv);
 template uint64_t mem_read_helper(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t eip, uint8_t is_priv);
+template uint80_t mem_read_helper(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t eip, uint8_t is_priv);
+template uint128_t mem_read_helper(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t eip, uint8_t is_priv);
 template void mem_write_helper<uint8_t, false>(cpu_ctx_t *cpu_ctx, addr_t addr, uint8_t val, uint32_t eip, uint8_t is_priv);
 template void mem_write_helper<uint16_t, false>(cpu_ctx_t *cpu_ctx, addr_t addr, uint16_t val, uint32_t eip, uint8_t is_priv);
 template void mem_write_helper<uint32_t, false>(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t val, uint32_t eip, uint8_t is_priv);
 template void mem_write_helper<uint64_t, false>(cpu_ctx_t *cpu_ctx, addr_t addr, uint64_t val, uint32_t eip, uint8_t is_priv);
+template void mem_write_helper<uint80_t, false>(cpu_ctx_t *cpu_ctx, addr_t addr, uint80_t val, uint32_t eip, uint8_t is_priv);
+template void mem_write_helper<uint128_t, false>(cpu_ctx_t *cpu_ctx, addr_t addr, uint128_t val, uint32_t eip, uint8_t is_priv);
 template void mem_write_helper<uint8_t, true>(cpu_ctx_t *cpu_ctx, addr_t addr, uint8_t val, uint32_t eip, uint8_t is_priv);
 template void mem_write_helper<uint16_t, true>(cpu_ctx_t *cpu_ctx, addr_t addr, uint16_t val, uint32_t eip, uint8_t is_priv);
 template void mem_write_helper<uint32_t, true>(cpu_ctx_t *cpu_ctx, addr_t addr, uint32_t val, uint32_t eip, uint8_t is_priv);
 template void mem_write_helper<uint64_t, true>(cpu_ctx_t *cpu_ctx, addr_t addr, uint64_t val, uint32_t eip, uint8_t is_priv);
+template void mem_write_helper<uint128_t, true>(cpu_ctx_t *cpu_ctx, addr_t addr, uint128_t val, uint32_t eip, uint8_t is_priv);
 
 template uint8_t io_read_helper(cpu_ctx_t *cpu_ctx, port_t port, uint32_t eip);
 template uint16_t io_read_helper(cpu_ctx_t *cpu_ctx, port_t port, uint32_t eip);

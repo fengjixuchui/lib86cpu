@@ -25,14 +25,23 @@ struct op_info {
 	op_info(size_t val_, size_t bits_) : val(val_), bits(bits_) {}
 };
 
+enum class fpu_instr_t : int {
+	integer8,
+	integer16,
+	integer32,
+	integer64,
+	float_,
+	bcd,
+};
+
 class lc86_jit : public Target {
 public:
 	lc86_jit(cpu_t *cpu);
 	void gen_code_block();
-	void gen_tc_prologue() { start_new_session(); gen_prologue_main(); }
+	void gen_tc_prologue() { start_new_session(); gen_exit_func(); gen_prologue_main(); }
 	void gen_tc_epilogue();
 	void gen_aux_funcs();
-	void gen_hook(void *hook_addr);
+	void gen_hook(hook_t hook_addr);
 	void gen_raise_exp_inline(uint32_t fault_addr, uint16_t code, uint16_t idx, uint32_t eip);
 	void free_code_block(void *addr) { m_mem.release_sys_mem(addr); }
 	void destroy_all_code() { m_mem.destroy_all_blocks(); }
@@ -73,8 +82,11 @@ public:
 	void dec(ZydisDecodedInstruction *instr);
 	void div(ZydisDecodedInstruction *instr);
 	void enter(ZydisDecodedInstruction *instr);
+	void fld(ZydisDecodedInstruction *instr);
 	void fninit(ZydisDecodedInstruction *instr);
 	void fnstsw(ZydisDecodedInstruction *instr);
+	void fxrstor(ZydisDecodedInstruction *instr);
+	void fxsave(ZydisDecodedInstruction *instr);
 	void hlt(ZydisDecodedInstruction *instr);
 	void idiv(ZydisDecodedInstruction *instr);
 	void imul(ZydisDecodedInstruction *instr);
@@ -103,6 +115,7 @@ public:
 	void lss(ZydisDecodedInstruction *instr);
 	void ltr(ZydisDecodedInstruction *instr);
 	void mov(ZydisDecodedInstruction *instr);
+	void movaps(ZydisDecodedInstruction *instr);
 	void movs(ZydisDecodedInstruction *instr);
 	void movsx(ZydisDecodedInstruction *instr);
 	void movzx(ZydisDecodedInstruction *instr);
@@ -153,13 +166,8 @@ public:
 	void xlat(ZydisDecodedInstruction *instr);
 	void xor_(ZydisDecodedInstruction *instr);
 
-#if defined(_WIN64)
-	uint8_t *gen_exception_info(uint8_t *code_ptr, size_t code_size);
-
-private:
-	void create_unwind_info();
-
-	uint8_t m_unwind_info[4 + 12];
+#if defined(_WIN64) || defined (__linux__)
+	void gen_exception_info(uint8_t *code_ptr, size_t code_size);
 #endif
 
 private:
@@ -168,7 +176,8 @@ private:
 	template<bool set_ret = true>
 	void gen_epilogue_main();
 	void gen_tail_call(x86::Gp addr);
-	void gen_block_end_checks();
+	void gen_exit_func();
+	void gen_interrupt_check();
 	void gen_no_link_checks();
 	bool gen_check_rf_single_step();
 	template<typename T>
@@ -176,6 +185,8 @@ private:
 	void gen_link_dst_only();
 	void gen_link_indirect();
 	void gen_link_ret();
+	template<typename T>
+	void gen_link_dst_cond(T &&lambda);
 	template<bool terminates, typename T1, typename T2, typename T3, typename T4>
 	void gen_raise_exp_inline(T1 fault_addr, T2 code, T3 idx, T4 eip);
 	template<bool terminates>
@@ -237,6 +248,13 @@ private:
 	void gen_virtual_stack_push();
 	template<unsigned num, unsigned store_at = 0, bool write_esp = true>
 	void gen_stack_pop();
+	void gen_simd_mem_align_check();
+	template<bool is_push, fpu_instr_t instr_type>
+	void gen_fpu_stack_check();
+	void gen_fpu_exp_post_check();
+	void gen_set_host_fpu_ctx();
+	template<bool update_fdp>
+	void gen_update_fpu_ptr(ZydisDecodedInstruction *instr);
 	template<unsigned idx>
 	void shift(ZydisDecodedInstruction *instr);
 	template<unsigned idx>

@@ -11,7 +11,6 @@
 #include "clock.h"
 #include <assert.h>
 #include <optional>
-#include <immintrin.h>
 
 #ifdef LIB86CPU_X64_EMITTER
 
@@ -92,11 +91,22 @@ static_assert(ZYDIS_REGISTER_DR7 - ZYDIS_REGISTER_DR0 == 7);
 #define R13 x86::r13
 #define R14 x86::r14
 #define R15 x86::r15
+#define XMM0 x86::xmm0
+#define XMM1 x86::xmm1
+#define XMM2 x86::xmm2
+#define XMM3 x86::xmm3
+#define XMM4 x86::xmm4
+#define XMM5 x86::xmm5
+#define XMM6 x86::xmm6
+#define XMM7 x86::xmm7
 
 #define RCX_HOME_off 8  // skip ret rip that was pushed on the stack by the caller
 #define RDX_HOME_off 16
 #define R8_HOME_off  24
 #define R9_HOME_off  32
+
+#define JIT_LOCAL_VARS_STACK_SIZE  0x30 // must be a multiple of 16
+#define JIT_REG_ARGS_STACK_SIZE    0x20
 
 // all x64 regs that can actually be used in the main jitted function
 enum class x64 : uint32_t {
@@ -144,7 +154,85 @@ static const std::unordered_map<x64, x86::Gp> reg_to_sized_reg = {
 	{ x64::r11 | SIZE32,  R11D },
 };
 
+// The following calculates how much stack is needed to hold the stack arguments for any callable function from the jitted code. This value is then
+// increased of a fixed amount to hold the stack local variables of the main jitted function and the register args of the calles
+// NOTE1: the jitted main() and exit() are also called during code linking, but those only use register args
+// NOTE2: this assumes the Windows x64 calling convention
+
+template<typename R, typename... Args>
+consteval std::integral_constant<size_t, sizeof...(Args)>
+get_arg_count(R(JIT_API *f)(Args...))
+{
+	return std::integral_constant<size_t, sizeof...(Args)>{};
+}
+
+template<size_t idx>
+consteval size_t
+max_stack_required_for_func()
+{
+	if constexpr (constexpr size_t num_args = decltype(get_arg_count(std::get<idx>(all_callable_funcs)))::value; num_args > 4) {
+		return (num_args - 4) * 8;
+	}
+
+	return 0;
+}
+
+template<size_t idx>
+struct max_stack_required
+{
+	static constexpr size_t stack = std::max(max_stack_required<idx - 1>::stack, max_stack_required_for_func<idx>());
+};
+
+template<>
+struct max_stack_required<0>
+{
+	static constexpr size_t stack = max_stack_required_for_func<0>();
+};
+
+consteval size_t
+get_tot_args_stack_required()
+{
+	// on WIN64, the stack is 16 byte aligned
+	return (max_stack_required<std::tuple_size_v<decltype(all_callable_funcs)> - 1>::stack + 15) & ~15;
+}
+
+constexpr size_t local_vars_size = JIT_LOCAL_VARS_STACK_SIZE;
+constexpr size_t reg_args_size = JIT_REG_ARGS_STACK_SIZE;
+constexpr size_t stack_args_size = get_tot_args_stack_required();
+constexpr size_t tot_arg_size = stack_args_size + reg_args_size + local_vars_size;
+
 size_t
+get_jit_stack_required_runtime()
+{
+	// runtime version used by x64_exceptions.cpp
+	return tot_arg_size;
+}
+static constexpr size_t
+get_jit_stack_required()
+{
+	return tot_arg_size;
+}
+
+static constexpr size_t
+get_jit_reg_args_size()
+{
+	return reg_args_size;
+}
+
+static constexpr size_t
+get_jit_stack_args_size()
+{
+	return stack_args_size;
+}
+
+static constexpr size_t
+get_jit_local_vars_size()
+{
+	return local_vars_size;
+}
+
+// calculates a stack offset at runtime
+static size_t
 get_local_var_offset(size_t idx)
 {
 	if (idx > (get_jit_local_vars_size() / 8 - 1)) {
@@ -155,15 +243,21 @@ get_local_var_offset(size_t idx)
 	}
 }
 
+// calculates a stack offset at compile time
 template<size_t idx>
-size_t
+static constexpr size_t
 get_local_var_offset()
 {
-	return get_local_var_offset(idx);
+	if (idx > (get_jit_local_vars_size() / 8 - 1)) {
+		throw std::logic_error("Attempted to use a local variable for which not enough stack was allocated for");
+	}
+	else {
+		return idx * 8 + get_jit_reg_args_size() + get_jit_stack_args_size();
+	}
 }
 
 template<x86::Gp reg>
-size_t
+constexpr size_t
 get_reg_arg_offset()
 {
 	// this adds get_jit_stack_required() to revert SUB(RSP, get_jit_stack_required()), then adds 8 to revert PUSH(RBX)
@@ -189,17 +283,22 @@ get_reg_arg_offset()
 #define STACK_ARGS_off get_jit_reg_args_size()
 #define REG_ARG_off(reg) get_reg_arg_offset<reg>()
 
+static_assert((LOCAL_VARS_off(0) & 15) == 0); // must be 16 byte aligned so that sse can work on it in lc86_jit::load_mem
+
 // [reg]
 #define MEM8(reg)  x86::byte_ptr(reg)
 #define MEM16(reg) x86::word_ptr(reg)
 #define MEM32(reg) x86::dword_ptr(reg)
 #define MEM64(reg) x86::qword_ptr(reg)
+#define MEM128(reg) x86::xmmword_ptr(reg)
 #define MEM(reg, size) x86::Mem(reg, size)
 // [reg + disp]
 #define MEMD8(reg, disp)  x86::byte_ptr(reg, disp)
 #define MEMD16(reg, disp) x86::word_ptr(reg, disp)
 #define MEMD32(reg, disp) x86::dword_ptr(reg, disp)
 #define MEMD64(reg, disp) x86::qword_ptr(reg, disp)
+#define MEMD80(reg, disp) x86::tword_ptr(reg, disp)
+#define MEMD128(reg, disp) x86::xmmword_ptr(reg, disp)
 #define MEMD(reg, disp, size) x86::Mem(reg, disp, size)
 // [reg + idx * scale], scale specified as 1 << n; e.g. scale = 8 -> n = 3
 #define MEMS8(reg, idx, scale)  x86::byte_ptr(reg, idx, scale)
@@ -218,6 +317,7 @@ get_reg_arg_offset()
 #define MEMSD16(reg, idx, scale, disp) x86::word_ptr(reg, idx, scale, disp)
 #define MEMSD32(reg, idx, scale, disp) x86::dword_ptr(reg, idx, scale, disp)
 #define MEMSD64(reg, idx, scale, disp) x86::qword_ptr(reg, idx, scale, disp)
+#define MEMSD80(reg, idx, scale, disp) x86::tword_ptr(reg, idx, scale, disp)
 #define MEMSD(reg, idx, scale, disp, size) x86::Mem(reg, idx, scale, disp, size)
 
 #define MOV(dst, src) m_a.mov(dst, src)
@@ -290,7 +390,15 @@ get_reg_arg_offset()
 #define CMOV_EQ(dst, src) m_a.cmove(dst, src)
 #define CMOV_NE(dst, src) m_a.cmovne(dst, src)
 
+#define EMMS() m_a.emms()
 #define FLDCW(src) m_a.fldcw(src)
+#define FNSTCW(dst) m_a.fnstcw(dst)
+#define FNSTSW(dst) m_a.fnstsw(dst)
+#define FNCLEX() m_a.fnclex()
+#define FLD(src) m_a.fld(src)
+#define FSTP(dst) m_a.fstp(dst)
+
+#define MOVAPS(dst, src) m_a.movaps(dst, src)
 
 #define LD_R8L(dst, reg_offset) MOV(dst, MEMD8(RCX, reg_offset))
 #define LD_R8H(dst, reg_offset) MOV(dst, MEMD8(RCX, reg_offset + 1))
@@ -311,8 +419,10 @@ get_reg_arg_offset()
 
 #define LD_MEM() load_mem(m_cpu->size_mode, 0)
 #define LD_MEMs(size) load_mem(size, 0)
+#define LD_MEM128() load_mem(SIZE128, 0)
 #define ST_MEM(val) store_mem(val, m_cpu->size_mode, 0)
 #define ST_MEMs(val, size) store_mem(val, size, 0)
+#define ST_MEM128(val) store_mem(val, SIZE128, 0)
 #define ST_MEMv(val) store_mem<decltype(val), true>(val, m_cpu->size_mode, 0)
 
 #define LD_IO() load_io(m_cpu->size_mode)
@@ -338,6 +448,7 @@ get_reg_arg_offset()
 #define GET_IMM() get_immediate_op(instr, OPNUM_SRC)
 
 #define RELOAD_RCX_CTX() MOV(RCX, &m_cpu->cpu_ctx)
+#define RESTORE_FPU_CTX() FLDCW(MEMD16(RSP, LOCAL_VARS_off(5)))
 #define CALL_F(func) MOV(RAX, func); CALL(RAX); RELOAD_RCX_CTX()
 
 
@@ -384,18 +495,14 @@ lc86_jit::gen_code_block()
 	// when an exception is thrown. Note that the sections need to be DWORD aligned
 	estimated_code_size += 24;
 	estimated_code_size = (estimated_code_size + 3) & ~3;
+#elif defined (__linux__)
+	// Increase estimated_code_size by 24 + 40 + 4, to accomodate the .eh_frame section required to unwind the function
+	// when an exception is thrown. Note that the section needs to be 8 byte aligned
+	estimated_code_size += (24 + 40 + 4);
+	estimated_code_size = (estimated_code_size + 7) & ~7;
 #endif
 
-	// Increase estimated_code_size by 11, to accomodate the exit function that terminates the execution of this tc.
-	// Note that this function should be 16 byte aligned
-	estimated_code_size += 11;
-	estimated_code_size = (estimated_code_size + 15) & ~15;
-
 	auto block = m_mem.allocate_sys_mem(estimated_code_size);
-	if (!block.addr) {
-		throw lc86_exp_abort("Failed to allocate memory for the generated code", lc86_status::no_memory);
-	}
-
 	if (auto err = m_code.relocateToBase(reinterpret_cast<uintptr_t>(block.addr))) {
 		std::string err_str("Asmjit failed at relocateToBase() with the error ");
 		err_str += DebugUtils::errorAsString(err);
@@ -410,37 +517,14 @@ lc86_jit::gen_code_block()
 	size_t buff_size = static_cast<size_t>(section->bufferSize());
 
 	assert(offset + buff_size <= estimated_code_size);
-	uint8_t *main_offset = static_cast<uint8_t *>(block.addr) + offset;
-	std::memcpy(main_offset, section->data(), buff_size);
+	uint8_t *exit_offset = static_cast<uint8_t *>(block.addr) + offset;
+	uint8_t *main_offset = exit_offset + 16;
+	std::memcpy(exit_offset, section->data(), buff_size);
 
-#if defined(_WIN64)
+#if defined(_WIN64) || defined(__linux__)
 	// According to asmjit's source code, the code size can decrease after the relocation above, so we need to query it again
-	uint8_t *exit_offset = gen_exception_info(main_offset, m_code.codeSize());
-#else
-	uint8_t *exit_offset = static_cast<uint8_t *>(block.addr) + offset + buff_size;
+	gen_exception_info(main_offset, m_code.codeSize() - 16);
 #endif
-
-	exit_offset = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(exit_offset) + 15) & ~15);
-
-
-	// Now generate the exit() function. Since it's a leaf function, it doesn't need an exception table on WIN64
-
-	static constexpr uint8_t exit_buff[] = {
-		0x48, // rex prefix
-		0xB8, // movabs rax, imm64
-		0,
-		0,
-		0,
-		0,
-		0,
-		0,
-		0,
-		0,
-		0xC3, // ret
-	};
-
-	std::memcpy(exit_offset, exit_buff, sizeof(exit_buff));
-	*reinterpret_cast<uint64_t *>(exit_offset + 2) = reinterpret_cast<uintptr_t>(tc);
 
 	// This code block is complete, so protect and flush the instruction cache now
 	m_mem.protect_sys_mem(block, MEM_READ | MEM_EXEC);
@@ -490,17 +574,6 @@ lc86_jit::gen_aux_funcs()
 	m_a.lock().and_(MEMD32(RCX, CPU_CTX_INT), ~CPU_HW_INT);
 	RET();
 
-	// set host fctrl
-	size_t set_fctrl_off = m_a.offset(), set_fctrl_off_aligned16 = (set_fctrl_off + 15) & ~15;
-	if (set_fctrl_off_aligned16 > set_fctrl_off) {
-		for (unsigned i = 0; i < (set_fctrl_off_aligned16 - set_fctrl_off); ++i) {
-			INT3();
-		}
-	}
-	MOV(MEMD16(RSP, REG_ARG_off(RCX)), CX);
-	FLDCW(MEMD16(RSP, REG_ARG_off(RCX)));
-	RET();
-
 	if (auto err = m_code.flatten()) {
 		std::string err_str("Asmjit failed at flatten() with the error ");
 		err_str += DebugUtils::errorAsString(err);
@@ -519,10 +592,6 @@ lc86_jit::gen_aux_funcs()
 	}
 
 	auto block = m_mem.allocate_sys_mem(estimated_code_size);
-	if (!block.addr) {
-		throw lc86_exp_abort("Failed to allocate memory for the generated code", lc86_status::no_memory);
-	}
-
 	if (auto err = m_code.relocateToBase(reinterpret_cast<uintptr_t>(block.addr))) {
 		std::string err_str("Asmjit failed at relocateToBase() with the error ");
 		err_str += DebugUtils::errorAsString(err);
@@ -544,12 +613,27 @@ lc86_jit::gen_aux_funcs()
 	m_cpu->raise_int_fn = reinterpret_cast<raise_int_t>(static_cast<uint8_t *>(block.addr) + offset + raise_int_off_aligned16);
 	m_cpu->clear_int_fn = reinterpret_cast<clear_int_t>(static_cast<uint8_t *>(block.addr) + offset + clear_int_off_aligned16);
 	m_cpu->lower_hw_int_fn = reinterpret_cast<clear_int_t>(static_cast<uint8_t *>(block.addr) + offset + lower_hw_int_off_aligned16);
-	m_cpu->set_fctrl_fn = reinterpret_cast<set_fctrl_t>(static_cast<uint8_t *>(block.addr) + offset + set_fctrl_off_aligned16);
 }
 
+void
+lc86_jit::gen_exit_func()
+{
+	// this should be emitted before main(), so that we can calculate the tc ptr from tc->ptr_code by simply subtracting an offset
+
+	size_t exit_off_start = m_a.offset();
+	MOV(RAX, m_cpu->tc);
+	RET();
+	size_t exit_off_end = m_a.offset();
+	assert((exit_off_end - exit_off_start) == 11);
+
+	size_t main_off_aligned16 = (exit_off_end + 15) & ~15;
+	for (unsigned i = 0; i < (main_off_aligned16 - exit_off_end); ++i) {
+		INT3();
+	}
+}
 
 void
-lc86_jit::gen_block_end_checks()
+lc86_jit::gen_interrupt_check()
 {
 	Label no_int = m_a.newLabel();
 	if (m_cpu->cpu_ctx.hflags & HFLG_TIMEOUT) {
@@ -577,6 +661,15 @@ lc86_jit::gen_block_end_checks()
 void
 lc86_jit::gen_no_link_checks()
 {
+	if ((m_cpu->disas_ctx.flags & DISAS_FLG_INHIBIT_INT) && (m_cpu->cpu_ctx.hflags & HFLG_INHIBIT_INT)) {
+		assert(m_cpu->disas_ctx.flags & DISAS_FLG_ONE_INSTR);
+
+		MOV(EAX, MEMD32(RCX, CPU_CTX_HFLG));
+		AND(EAX, ~HFLG_INHIBIT_INT);
+		MOV(MEMD32(RCX, CPU_CTX_HFLG), EAX);
+		m_cpu->cpu_flags |= CPU_FORCE_INSERT;
+	}
+
 	if (m_cpu->cpu_ctx.hflags & HFLG_DBG_TRAP) {
 		LD_R32(EAX, CPU_CTX_EIP);
 		gen_raise_exp_inline<true>(0, 0, EXP_DB, EAX);
@@ -587,7 +680,7 @@ lc86_jit::gen_no_link_checks()
 		return;
 	}
 
-	gen_block_end_checks();
+	gen_interrupt_check();
 }
 
 void
@@ -609,6 +702,8 @@ lc86_jit::gen_prologue_main()
 	// Two additions and a shift can be done with LEA and the sib addressing mode. Comparisons with zero are ususally done with TEST reg, reg instead of CMP. Left shifting
 	// by one can be done with ADD reg, reg. Reading an 8/16 bit reg and then zero/sign extending to 32 can be done with a single MOVZ/SX reg, word/byte ptr [rcx, off] instead
 	// of MOV and then MOVZ/SX. Call external C++ helper functions to implement the most difficult instructions.
+	// Guest SSE is currently emulated with host SSE. If the library is compiled with AVX support, then the jit should emit VZEROUPPER to avoid the performance penalty
+	// associated with mixing lagacy SSE with AVX, or better, it should just emit AVX instructions directly
 
 	PUSH(RBX);
 	SUB(RSP, get_jit_stack_required());
@@ -685,9 +780,9 @@ void lc86_jit::gen_raise_exp_inline()
 }
 
 void
-lc86_jit::gen_hook(void *hook_addr)
+lc86_jit::gen_hook(hook_t hook_addr)
 {
-	CALL_F(reinterpret_cast<uintptr_t>(hook_addr));
+	CALL_F(hook_addr);
 	gen_link_ret();
 }
 
@@ -761,9 +856,8 @@ void lc86_jit::gen_link_direct(addr_t dst_pc, addr_t *next_pc, T target_pc)
 		if (next_pc) { // if(dst_pc) -> cond jmp dst_pc; if(next_pc) -> cond jmp next_pc
 			if (dst) {
 				MOV(RDX, &m_cpu->tc->flags);
-				MOV(R8D, MEM32(RDX));
-				MOV(EAX, ~TC_FLG_JMP_TAKEN);
-				AND(EAX, R8D);
+				MOV(EAX, MEM32(RDX));
+				AND(EAX, ~TC_FLG_JMP_TAKEN);
 				if constexpr (std::is_integral_v<T>) {
 					if (target_pc == dst_pc) {
 						MOV(MEM32(RDX), EAX);
@@ -793,9 +887,8 @@ void lc86_jit::gen_link_direct(addr_t dst_pc, addr_t *next_pc, T target_pc)
 			}
 			else {
 				MOV(RDX, &m_cpu->tc->flags);
-				MOV(R8D, MEM32(RDX));
-				MOV(EAX, ~TC_FLG_JMP_TAKEN);
-				AND(EAX, R8D);
+				MOV(EAX, MEM32(RDX));
+				AND(EAX, ~TC_FLG_JMP_TAKEN);
 				if constexpr (std::is_integral_v<T>) {
 					if (target_pc == *next_pc) {
 						OR(EAX, TC_JMP_NEXT_PC << 4);
@@ -836,9 +929,8 @@ void lc86_jit::gen_link_direct(addr_t dst_pc, addr_t *next_pc, T target_pc)
 
 	case 2: { // cond jmp next_pc + uncond jmp dst_pc
 		MOV(RDX, &m_cpu->tc->flags);
-		MOV(R8D, MEM32(RDX));
-		MOV(EAX, ~TC_FLG_JMP_TAKEN);
-		AND(EAX, R8D);
+		MOV(EAX, MEM32(RDX));
+		AND(EAX, ~TC_FLG_JMP_TAKEN);
 		if constexpr (std::is_integral_v<T>) {
 			if (target_pc == *next_pc) {
 				OR(EAX, TC_JMP_NEXT_PC << 4);
@@ -909,6 +1001,40 @@ lc86_jit::gen_link_ret()
 	// NOTE: perhaps find a way to use a return stack buffer to link to the next tc
 
 	gen_link_indirect();
+}
+
+template<typename T>
+void lc86_jit::gen_link_dst_cond(T &&lambda)
+{
+	// condition result should be in ebx; if true, jumps to dst, otherwise jumps to next
+
+	m_needs_epilogue = false;
+
+	gen_no_link_checks();
+
+	if ((m_cpu->virt_pc & ~PAGE_MASK) == (m_cpu->virt_pc + m_cpu->instr_bytes & ~PAGE_MASK)) {
+		MOV(RDX, &m_cpu->tc->flags);
+		MOV(EAX, MEM32(RDX));
+		AND(EAX, ~TC_FLG_JMP_TAKEN);
+		lambda();
+		Label dst = m_a.newLabel();
+		BR_EQ(dst);
+		OR(EAX, TC_JMP_NEXT_PC << 4);
+		MOV(MEM32(RDX), EAX);
+		MOV(RDX, &m_cpu->tc->jmp_offset[1]);
+		MOV(RAX, MEM64(RDX));
+		gen_tail_call(RAX);
+		m_a.bind(dst);
+		MOV(MEM32(RDX), EAX);
+		MOV(RDX, &m_cpu->tc->jmp_offset[0]);
+		MOV(RAX, MEM64(RDX));
+		gen_tail_call(RAX);
+
+		m_cpu->tc->flags |= ((2 & TC_FLG_NUM_JMP) | TC_FLG_DST_COND);
+	}
+	else {
+		gen_epilogue_main();
+	}
 }
 
 template<bool add_seg_base>
@@ -1052,6 +1178,9 @@ op_info lc86_jit::get_operand(ZydisDecodedInstruction *instr, const unsigned opn
 
 		case 32:
 			return { offset, SIZE32 };
+
+		case 128:
+			return { offset, SIZE128 };
 
 		default:
 			LIB86CPU_ABORT();
@@ -1733,30 +1862,53 @@ void
 lc86_jit::load_mem(uint8_t size, uint8_t is_priv)
 {
 	// RCX: cpu_ctx, EDX: addr, R8: instr_eip, R9B: is_priv
-
-	MOV(R9B, is_priv);
-	MOV(R8D, m_cpu->instr_eip);
+	// for SIZE128/80 -> RCX: ptr to stack-allocated uint128/80_t, RDX: cpu_ctx, R8: addr, R9: instr_eip, stack: is_priv
 
 	switch (size)
 	{
-	case SIZE64:
-		CALL_F(&mem_read_helper<uint64_t>);
+	case SIZE128:
+		LEA(RCX, MEMD64(RSP, LOCAL_VARS_off(0)));
+		MOV(R8D, EDX);
+		MOV(RDX, &m_cpu->cpu_ctx);
+		MOV(R9D, m_cpu->instr_eip);
+		MOV(MEMD8(RSP, LOCAL_VARS_off(2)), is_priv);
+		CALL_F(&mem_read_helper<uint128_t>);
 		break;
 
-	case SIZE32:
-		CALL_F(&mem_read_helper<uint32_t>);
-		break;
-
-	case SIZE16:
-		CALL_F(&mem_read_helper<uint16_t>);
-		break;
-
-	case SIZE8:
-		CALL_F(&mem_read_helper<uint8_t>);
+	case SIZE80:
+		LEA(RCX, MEMD64(RSP, LOCAL_VARS_off(0)));
+		MOV(R8D, EDX);
+		MOV(RDX, &m_cpu->cpu_ctx);
+		MOV(R9D, m_cpu->instr_eip);
+		MOV(MEMD8(RSP, LOCAL_VARS_off(2)), is_priv);
+		CALL_F(&mem_read_helper<uint80_t>);
 		break;
 
 	default:
-		LIB86CPU_ABORT();
+		MOV(R9B, is_priv);
+		MOV(R8D, m_cpu->instr_eip);
+
+		switch (size)
+		{
+		case SIZE64:
+			CALL_F(&mem_read_helper<uint64_t>);
+			break;
+
+		case SIZE32:
+			CALL_F(&mem_read_helper<uint32_t>);
+			break;
+
+		case SIZE16:
+			CALL_F(&mem_read_helper<uint16_t>);
+			break;
+
+		case SIZE8:
+			CALL_F(&mem_read_helper<uint8_t>);
+			break;
+
+		default:
+			LIB86CPU_ABORT();
+		}
 	}
 }
 
@@ -1777,6 +1929,13 @@ void lc86_jit::store_mem(T val, uint8_t size, uint8_t is_priv)
 
 	switch (size)
 	{
+	case SIZE128:
+		if (!is_r8) {
+			MOV(R8, val);
+		}
+		CALL_F((&mem_write_helper<uint128_t, dont_write>));
+		break;
+
 	case SIZE64:
 		if (!is_r8) {
 			MOV(R8, val);
@@ -2181,6 +2340,138 @@ void lc86_jit::gen_stack_pop()
 
 	default:
 		LIB86CPU_ABORT();
+	}
+}
+
+void
+lc86_jit::gen_simd_mem_align_check()
+{
+	Label ok = m_a.newLabel();
+	TEST(EDX, 15);
+	BR_EQ(ok);
+	RAISEin0_f(EXP_GP);
+	m_a.bind(ok);
+}
+
+template<bool is_push, fpu_instr_t instr_type>
+void lc86_jit::gen_fpu_stack_check()
+{
+	// this function places in EBX the value of the fpu stack top after the push/pop, and in R8D the flags of the status word following a stack fault. It also writes
+	// to the host stack, at offset zero, an appropriate indefinite value when it detects a masked stack exception
+	// NOTE: we only support masked stack exceptions for now
+
+	Label no_stack_fault = m_a.newLabel(), exp_masked = m_a.newLabel();
+	XOR(R8D, R8D);
+	if constexpr (is_push) {
+		// detect stack overflow
+		MOVZX(EBX, MEMD16(RCX, FPU_DATA_FTOP));
+		SUB(EBX, 1);
+		AND(EBX, 7);
+		MOV(AX, MEMSD16(RCX, RBX, 0, CPU_CTX_FTAGS0));
+		CMP(AX, FPU_TAG_EMPTY);
+		BR_EQ(no_stack_fault);
+	}
+	else {
+		// detect stack underflow
+		MOVZX(EBX, MEMD16(RCX, FPU_DATA_FTOP));
+		ADD(EBX, 1);
+		AND(EBX, 7);
+		MOV(AX, MEMSD16(RCX, RBX, 0, CPU_CTX_FTAGS0));
+		CMP(AX, FPU_TAG_EMPTY);
+		BR_NE(no_stack_fault);
+	}
+
+	MOVZX(EAX, MEMD16(RCX, CPU_CTX_FCTRL));
+	TEST(EAX, FPU_EXP_INVALID);
+	BR_NE(exp_masked);
+	static const char *abort_msg = "Unmasked fpu stack exception not supported";
+	MOV(RCX, abort_msg);
+	MOV(RAX, &cpu_runtime_abort);
+	CALL(RAX); // won't return
+	INT3();
+	m_a.bind(exp_masked);
+	// stack fault exception masked, write an indefinite value, so that the fpu instr uses it
+	MOVZX(R8D, MEMD16(RCX, CPU_CTX_FSTATUS));
+	OR(R8D, FPU_FLG_IE | FPU_FLG_SF | (is_push ? (1 << FPU_C1_SHIFT) : (0 << FPU_C1_SHIFT)));
+
+	switch (instr_type)
+	{
+	case fpu_instr_t::integer8:
+		MOV(MEMD8(RSP, LOCAL_VARS_off(0)), FPU_INTEGER_INDEFINITE8);
+		break;
+
+	case fpu_instr_t::integer16:
+		MOV(MEMD16(RSP, LOCAL_VARS_off(0)), FPU_INTEGER_INDEFINITE16);
+		break;
+
+	case fpu_instr_t::integer32:
+		MOV(MEMD32(RSP, LOCAL_VARS_off(0)), FPU_INTEGER_INDEFINITE32);
+		break;
+
+	case fpu_instr_t::integer64:
+		MOV(MEMD64(RSP, LOCAL_VARS_off(0)), FPU_INTEGER_INDEFINITE64);
+		break;
+
+	case fpu_instr_t::float_:
+		MOV(MEMD64(RSP, LOCAL_VARS_off(0)), FPU_QNAN_FLOAT_INDEFINITE64);
+		MOV(MEMD16(RSP, LOCAL_VARS_off(1)), FPU_QNAN_FLOAT_INDEFINITE16);
+		break;
+
+	case fpu_instr_t::bcd:
+		MOV(MEMD64(RSP, LOCAL_VARS_off(0)), FPU_BCD_INDEFINITE64);
+		MOV(MEMD16(RSP, LOCAL_VARS_off(1)), FPU_BCD_INDEFINITE16);
+		break;
+
+	default:
+		LIB86CPU_ABORT();
+	}
+	m_a.bind(no_stack_fault);
+}
+
+void
+lc86_jit::gen_fpu_exp_post_check()
+{
+	// this function should be called immediately after the fpu instr to check exceptions for. It expects to find in R8W the flags of the status word following
+	// a previous stack fault (if any happened)
+	// NOTE: we only support masked exceptions for now
+
+	Label no_exp = m_a.newLabel();
+	FNSTSW(AX);
+	TEST(AX, FPU_EXP_ALL);
+	BR_EQ(no_exp);
+	LD_R16(DX, CPU_CTX_FCTRL);
+	AND(DX, FPU_EXP_ALL);
+	CMP(DX, FPU_EXP_ALL);
+	BR_EQ(no_exp);
+	static const char *abort_msg = "Unmasked fpu exceptions are not supported";
+	MOV(RCX, abort_msg);
+	MOV(RAX, &cpu_runtime_abort);
+	CALL(RAX); // won't return
+	INT3();
+	m_a.bind(no_exp);
+	AND(AX, ~(FPU_FLG_SF | FPU_FLG_ES | FPU_FLG_TOP | FPU_FLG_BSY));
+	OR(AX, R8W);
+	ST_R16(CPU_CTX_FSTATUS, AX);
+}
+
+void
+lc86_jit::gen_set_host_fpu_ctx()
+{
+	EMMS(); // clear fpu tag word to avoid possible fpu stack faults
+	FNSTCW(MEMD16(RSP, LOCAL_VARS_off(5))); // save host control word so that we can restore it later
+	FLDCW(MEMD16(RCX, FPU_DATA_FRP)); // set precision and rounding according to the guest settings (fpu exceptions are all masked)
+	FNCLEX(); // clear all pending fpu exceptions, so that we can use the host to detect guest fpu exceptions
+}
+
+template<bool update_fdp>
+void lc86_jit::gen_update_fpu_ptr(ZydisDecodedInstruction *instr)
+{
+	ST_R16(CPU_CTX_FCS, m_cpu->cpu_ctx.regs.cs);
+	ST_R32(CPU_CTX_FIP, m_cpu->instr_eip);
+	MOV(AX, MEMD16(RCX, CPU_CTX_DS));
+	ST_R16(CPU_CTX_FDS, AX);
+	if constexpr (update_fdp) {
+		ST_R32(CPU_CTX_FDP, m_cpu->instr_eip + instr->raw.modrm.offset);
 	}
 }
 
@@ -3016,8 +3307,10 @@ void lc86_jit::lxs(ZydisDecodedInstruction *instr)
 		if constexpr (idx == SS_idx) {
 			ST_R32(CPU_CTX_EIP, m_cpu->instr_eip + m_cpu->instr_bytes);
 
-			gen_link_indirect();
-			m_cpu->tc->flags |= TC_FLG_INDIRECT;
+			gen_link_dst_cond([this] {
+				MOV(EBX, MEMD32(RCX, CPU_CTX_HFLG));
+				TEST(EBX, HFLG_SS32);
+				});
 			m_cpu->translate_next = 0;
 		}
 	}
@@ -3082,10 +3375,10 @@ void lc86_jit::bit(ZydisDecodedInstruction *instr)
 				auto src = GET_REG(OPNUM_SRC);
 				auto src_host_reg = SIZED_REG(x64::rbx, src.bits);
 				LD_REG_val(src_host_reg, src.val, src.bits);
-				lambda.operator()<true>(src_host_reg, dst_host_reg, rm);
+				lambda.template operator()<true>(src_host_reg, dst_host_reg, rm);
 			}
 			else {
-				lambda.operator()<true>(GET_IMM(), dst_host_reg, rm);
+				lambda.template operator()<true>(GET_IMM(), dst_host_reg, rm);
 			}
 		},
 		[this, instr, &lambda](const op_info rm)
@@ -3100,10 +3393,10 @@ void lc86_jit::bit(ZydisDecodedInstruction *instr)
 				auto src = GET_REG(OPNUM_SRC);
 				auto src_host_reg = SIZED_REG(x64::rbx, src.bits);
 				LD_REG_val(src_host_reg, src.val, src.bits);
-				lambda.operator()<false>(src_host_reg, dst_mem, rm);
+				lambda.template operator()<false>(src_host_reg, dst_mem, rm);
 			}
 			else {
-				lambda.operator()<false>(GET_IMM(), dst_mem, rm);
+				lambda.template operator()<false>(GET_IMM(), dst_mem, rm);
 			}
 		});
 
@@ -4806,6 +5099,75 @@ lc86_jit::enter(ZydisDecodedInstruction *instr)
 }
 
 void
+lc86_jit::fld(ZydisDecodedInstruction *instr)
+{
+	if (m_cpu->cpu_ctx.hflags & (HFLG_CR0_EM | HFLG_CR0_TS)) {
+		RAISEin0_t(EXP_NM);
+	}
+	else {
+		// XXX missing check for fpu unmasked exceptions
+		get_rm<OPNUM_SRC>(instr,
+			[this, instr](const op_info rm)
+			{
+				gen_fpu_stack_check<true, fpu_instr_t::float_>();
+				gen_set_host_fpu_ctx();
+				MOV(EDX, instr->raw.modrm.rm);
+				MOV(EAX, sizeof(uint80_t));
+				MUL(DX);
+				FLD(MEMSD80(RCX, RAX, 0, CPU_CTX_R0));
+				gen_fpu_exp_post_check();
+				MOV(EAX, sizeof(uint80_t));
+				ST_R16(FPU_DATA_FTOP, BX);
+				MUL(BX);
+				FSTP(MEMSD80(RCX, RAX, 0, CPU_CTX_R0));
+				gen_update_fpu_ptr<false>(instr);
+			},
+			[this, instr](const op_info rm)
+			{
+				switch (instr->opcode)
+				{
+				case 0xD9:
+					LD_MEMs(SIZE32);
+					MOV(MEMD32(RSP, LOCAL_VARS_off(0)), EAX);
+					gen_fpu_stack_check<true, fpu_instr_t::float_>();
+					gen_set_host_fpu_ctx();
+					FLD(MEMD32(RSP, LOCAL_VARS_off(0)));
+					break;
+
+				case 0xDD:
+					LD_MEMs(SIZE64);
+					MOV(MEMD64(RSP, LOCAL_VARS_off(0)), RAX);
+					gen_fpu_stack_check<true, fpu_instr_t::float_>();
+					gen_set_host_fpu_ctx();
+					FLD(MEMD64(RSP, LOCAL_VARS_off(0)));
+					break;
+
+				case 0xDB:
+					LD_MEMs(SIZE80);
+					gen_fpu_stack_check<true, fpu_instr_t::float_>();
+					gen_set_host_fpu_ctx();
+					FLD(MEMD80(RSP, LOCAL_VARS_off(0)));
+					break;
+
+				default:
+					LIB86CPU_ABORT();
+				}
+
+				gen_fpu_exp_post_check();
+				MOV(EAX, sizeof(uint80_t));
+				ST_R16(FPU_DATA_FTOP, BX);
+				MUL(BX);
+				FSTP(MEMSD80(RCX, RAX, 0, CPU_CTX_R0));
+				gen_update_fpu_ptr<true>(instr);
+			});
+
+		RESTORE_FPU_CTX();
+		MOV(EDX, EBX);
+		CALL_F(&fpu_update_tag);
+	}
+}
+
+void
 lc86_jit::fninit(ZydisDecodedInstruction *instr)
 {
 	if (m_cpu->cpu_ctx.hflags & (HFLG_CR0_EM | HFLG_CR0_TS)) {
@@ -4821,9 +5183,9 @@ lc86_jit::fninit(ZydisDecodedInstruction *instr)
 		ST_R16(CPU_CTX_FDS, 0);
 		ST_R32(CPU_CTX_FDP, 0);
 		ST_R16(CPU_CTX_FOP, 0);
-		ST_R16(FPU_DATA_FTSS, 0);
+		ST_R16(FPU_DATA_FTOP, 0);
 		ST_R16(FPU_DATA_FES, 0);
-		FLDCW(MEMD16(RCX, CPU_CTX_FCTRL)); // make host fctrl == guest fctrl
+		ST_R16(FPU_DATA_FRP, 0x37F);
 	}
 }
 
@@ -4843,6 +5205,56 @@ lc86_jit::fnstsw(ZydisDecodedInstruction *instr)
 			[this](const op_info rm)
 			{
 				ST_MEMs(R8W, SIZE16);
+			});
+	}
+}
+
+void
+lc86_jit::fxrstor(ZydisDecodedInstruction *instr)
+{
+	if (m_cpu->cpu_ctx.hflags & (HFLG_CR0_EM | HFLG_CR0_TS)) {
+		RAISEin0_t(EXP_NM);
+	}
+	else {
+		get_rm<OPNUM_SINGLE>(instr,
+			[](const op_info rm)
+			{
+				assert(0);
+			},
+			[this](const op_info rm)
+			{
+				MOV(R8D, m_cpu->instr_eip);
+				CALL_F(&fxrstor_helper);
+				Label ok = m_a.newLabel();
+				TEST(EAX, EAX);
+				BR_EQ(ok);
+				RAISEin0_f(EXP_GP);
+				m_a.bind(ok);
+			});
+	}
+}
+
+void
+lc86_jit::fxsave(ZydisDecodedInstruction *instr)
+{
+	if (m_cpu->cpu_ctx.hflags & (HFLG_CR0_EM | HFLG_CR0_TS)) {
+		RAISEin0_t(EXP_NM);
+	}
+	else {
+		get_rm<OPNUM_SINGLE>(instr,
+			[](const op_info rm)
+			{
+				assert(0);
+			},
+			[this](const op_info rm)
+			{
+				Label ok = m_a.newLabel();
+				TEST(EDX, 15);
+				BR_EQ(ok);
+				RAISEin0_f(EXP_GP);
+				m_a.bind(ok);
+				MOV(R8D, m_cpu->instr_eip);
+				CALL_F(&fxsave_helper);
 			});
 	}
 }
@@ -5326,8 +5738,7 @@ lc86_jit::invlpg(ZydisDecodedInstruction *instr)
 			},
 			[this](const op_info rm)
 			{
-				MOV(RCX, m_cpu);
-				CALL_F(&tlb_invalidate);
+				CALL_F(&tlb_invalidate_);
 			});
 	}
 }
@@ -6053,11 +6464,11 @@ lc86_jit::mov(ZydisDecodedInstruction *instr)
 			switch (cr_idx)
 			{
 			case CR0_idx:
+			case CR4_idx:
 				m_cpu->translate_next = 0;
 				[[fallthrough]];
 
-			case CR3_idx:
-			case CR4_idx: {
+			case CR3_idx: {
 				Label ok = m_a.newLabel();
 				MOV(R8D, cr_idx - CR_offset);
 				CALL_F(&update_crN_helper);
@@ -6065,7 +6476,7 @@ lc86_jit::mov(ZydisDecodedInstruction *instr)
 				BR_EQ(ok);
 				RAISEin0_f(EXP_GP);
 				m_a.bind(ok);
-				if (cr_idx == CR0_idx) {
+				if ((cr_idx == CR0_idx) || (cr_idx == CR4_idx)) {
 					ST_R32(CPU_CTX_EIP, m_cpu->instr_eip + m_cpu->instr_bytes);
 					gen_no_link_checks();
 				}
@@ -6234,10 +6645,15 @@ lc86_jit::mov(ZydisDecodedInstruction *instr)
 				BR_EQ(ok);
 				RAISEin_no_param_f();
 				m_a.bind(ok);
+				MOV(EAX, MEMD32(RCX, CPU_CTX_HFLG));
+				OR(EAX, HFLG_INHIBIT_INT);
+				MOV(MEMD32(RCX, CPU_CTX_HFLG), EAX);
 				ST_R32(CPU_CTX_EIP, m_cpu->instr_eip + m_cpu->instr_bytes);
 
-				gen_link_indirect();
-				m_cpu->tc->flags |= TC_FLG_INDIRECT;
+				gen_link_dst_cond([this] {
+					MOV(EBX, MEMD32(RCX, CPU_CTX_HFLG));
+					TEST(EBX, HFLG_SS32);
+					});
 				m_cpu->translate_next = 0;
 			}
 			else {
@@ -6352,6 +6768,56 @@ lc86_jit::mov(ZydisDecodedInstruction *instr)
 
 	default:
 		LIB86CPU_ABORT();
+	}
+}
+
+void
+lc86_jit::movaps(ZydisDecodedInstruction *instr)
+{
+	if (!((m_cpu->cpu_ctx.hflags & (HFLG_CR0_TS | HFLG_CR4_OSFXSR | HFLG_CR0_EM)) == HFLG_CR4_OSFXSR)) {
+		RAISEin0_t((m_cpu->cpu_ctx.hflags & HFLG_CR0_TS) ? EXP_NM : EXP_UD);
+	}
+	else {
+		switch (instr->opcode)
+		{
+		case 0x28: {
+			const auto dst = GET_REG(OPNUM_DST);
+			get_rm<OPNUM_SRC>(instr,
+				[this, dst](const op_info rm)
+				{
+					MOVAPS(XMM0, MEMD128(RCX, rm.val));
+					MOVAPS(MEMD128(RCX, dst.val), XMM0);
+				},
+				[this, dst](const op_info rm)
+				{
+					gen_simd_mem_align_check();
+					LD_MEM128();
+					MOVAPS(XMM0, MEM128(RAX));
+					MOVAPS(MEMD128(RCX, dst.val), XMM0);
+				});
+		}
+		break;
+
+		case 0x29: {
+			const auto src = GET_REG(OPNUM_SRC);
+			get_rm<OPNUM_DST>(instr,
+				[this, src](const op_info rm)
+				{
+					MOVAPS(XMM0, MEMD128(RCX, src.val));
+					MOVAPS(MEMD128(RCX, rm.val), XMM0);
+				},
+				[this, src](const op_info rm)
+				{
+					gen_simd_mem_align_check();
+					LEA(R8, MEMD64(RCX, src.val));
+					ST_MEM128(R8);
+				});
+		}
+		break;
+
+		default:
+			LIB86CPU_ABORT();
+		}
 	}
 }
 
@@ -6990,10 +7456,15 @@ lc86_jit::pop(ZydisDecodedInstruction *instr)
 			}
 
 			if (sel.first == SS_idx) {
+				MOV(EAX, MEMD32(RCX, CPU_CTX_HFLG));
+				OR(EAX, HFLG_INHIBIT_INT);
+				MOV(MEMD32(RCX, CPU_CTX_HFLG), EAX);
 				ST_R32(CPU_CTX_EIP, m_cpu->instr_eip + m_cpu->instr_bytes);
 
-				gen_link_indirect();
-				m_cpu->tc->flags |= TC_FLG_INDIRECT;
+				gen_link_dst_cond([this] {
+					MOV(EBX, MEMD32(RCX, CPU_CTX_HFLG));
+					TEST(EBX, HFLG_SS32);
+					});
 				m_cpu->translate_next = 0;
 			}
 		}
@@ -7171,8 +7642,10 @@ lc86_jit::popf(ZydisDecodedInstruction *instr)
 	MOV(MEMD32(RCX, CPU_CTX_EFLAGS_AUX), EDX);
 	ST_R32(CPU_CTX_EIP, m_cpu->instr_eip + m_cpu->instr_bytes);
 
-	gen_link_indirect();
-	m_cpu->tc->flags |= TC_FLG_INDIRECT;
+	if ((m_cpu->virt_pc & ~PAGE_MASK) == (m_cpu->virt_pc + m_cpu->instr_bytes & ~PAGE_MASK)) {
+		gen_link_indirect();
+		m_cpu->tc->flags |= TC_FLG_INDIRECT;
+	}
 	m_cpu->translate_next = 0;
 }
 
@@ -7998,6 +8471,7 @@ lc86_jit::sti(ZydisDecodedInstruction *instr)
 	assert(instr->opcode == 0xFB);
 
 	LD_R32(EAX, CPU_CTX_EFLAGS);
+	MOV(EDX, EAX);
 	if (m_cpu->cpu_ctx.hflags & HFLG_PE_MODE) {
 
 		// we don't support virtual 8086 mode, so we don't need to check for it
@@ -8013,6 +8487,20 @@ lc86_jit::sti(ZydisDecodedInstruction *instr)
 		OR(EAX, IF_MASK);
 		ST_R32(CPU_CTX_EFLAGS, EAX);
 	}
+	Label no_inhibition = m_a.newLabel();
+	TEST(EDX, IF_MASK);
+	BR_NE(no_inhibition);
+	MOV(EAX, MEMD32(RCX, CPU_CTX_HFLG));
+	OR(EAX, HFLG_INHIBIT_INT);
+	MOV(MEMD32(RCX, CPU_CTX_HFLG), EAX);
+	m_a.bind(no_inhibition);
+	ST_R32(CPU_CTX_EIP, m_cpu->instr_eip + m_cpu->instr_bytes);
+
+	gen_link_dst_cond([this] {
+		MOV(EBX, MEMD32(RCX, CPU_CTX_HFLG));
+		TEST(EBX, HFLG_INHIBIT_INT);
+		});
+	m_cpu->translate_next = 0;
 }
 
 void
